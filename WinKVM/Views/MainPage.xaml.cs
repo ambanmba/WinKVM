@@ -1,0 +1,201 @@
+using Microsoft.UI.Input;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
+using Windows.ApplicationModel.DataTransfer;
+using Windows.System;
+using WinKVM.Agent;
+using WinKVM.Input;
+using WinKVM.Models;
+using WinKVM.Protocol;
+
+namespace WinKVM.Views;
+
+public sealed partial class MainPage : Page
+{
+    private readonly ERICSession  _session     = new();
+    private readonly ProfileStore _profileStore = new();
+    private AgentLoop? _agentLoop;
+
+    public MainPage()
+    {
+        InitializeComponent();
+
+        LoginPage.SetProfileStore(_profileStore);
+        LoginPage.ConnectRequested += (host, port, user, pass) =>
+            _session.Connect(host, port, user, pass);
+
+        _session.StateChanged += OnSessionStateChanged;
+        _session.CertificateChallenge += OnCertificateChallenge;
+
+        KvmRenderer.IsTabStop = true;
+        KvmRenderer.Focus(FocusState.Programmatic);
+
+        // Wire up renderer
+        _session.Renderer = KvmRenderer;
+    }
+
+    // ── Session state ─────────────────────────────────────────────────────────
+
+    private void OnSessionStateChanged(SessionState state)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            LoginPage.Visibility      = state == SessionState.Disconnected ? Visibility.Visible  : Visibility.Collapsed;
+            ConnectingPanel.Visibility = (state == SessionState.Connecting || state == SessionState.Authenticating)
+                                        ? Visibility.Visible : Visibility.Collapsed;
+            ConnectedPanel.Visibility = state == SessionState.Connected ? Visibility.Visible : Visibility.Collapsed;
+
+            StatusText.Text = _session.StatusMessage;
+
+            DisconnectBtn.IsEnabled  = state == SessionState.Connected;
+            CtrlAltDelBtn.IsEnabled  = state == SessionState.Connected;
+            ScreenshotBtn.IsEnabled  = state == SessionState.Connected;
+            SendTextBtn.IsEnabled    = state == SessionState.Connected;
+            PasteBtn.IsEnabled       = state == SessionState.Connected;
+
+            if (state == SessionState.Connected)
+            {
+                ConnectingText.Text = "";
+                InitAgentLoop();
+                KvmRenderer.Focus(FocusState.Programmatic);
+            }
+            else if (state == SessionState.Disconnected || state is SessionState)
+            {
+                _agentLoop?.Stop();
+                _agentLoop = null;
+                AiPanel.Visibility = Visibility.Collapsed;
+            }
+        });
+    }
+
+    private void InitAgentLoop()
+    {
+        IAIProvider ai = new ClaudeProvider();
+        IOcrProvider ocr = new WindowsOcr();
+        _agentLoop = new AgentLoop(ai, ocr, _session);
+        AiPanel.SetAgentLoop(_agentLoop, _session);
+    }
+
+    private async Task<bool> OnCertificateChallenge(string fingerprint, string message)
+    {
+        var tcs = new TaskCompletionSource<bool>();
+        DispatcherQueue.TryEnqueue(async () =>
+        {
+            CertDialogText.Text = message;
+            var result = await CertDialog.ShowAsync();
+            tcs.SetResult(result == ContentDialogResult.Primary);
+        });
+        return await tcs.Task;
+    }
+
+    // ── Toolbar actions ───────────────────────────────────────────────────────
+
+    private void DisconnectBtn_Click  (object s, RoutedEventArgs e) => _session.Disconnect();
+    private void CtrlAltDelBtn_Click  (object s, RoutedEventArgs e) => _session.SendCtrlAltDel();
+    private void ReconnectBtn_Click   (object s, RoutedEventArgs e) => _session.Reconnect();
+    private void BackToLoginBtn_Click (object s, RoutedEventArgs e) => _session.Disconnect();
+    private void DiagnosticsBtn_Click (object s, RoutedEventArgs e) { /* TODO: diagnostics flyout */ }
+    private void SettingsBtn_Click    (object s, RoutedEventArgs e) { /* TODO: settings page */ }
+    private void SendTextBtn_Click    (object s, RoutedEventArgs e) { /* TODO: send text flyout */ }
+    private void AIAgentBtn_Click     (object s, RoutedEventArgs e)
+    {
+        AiPanel.Visibility = AiPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private void ScreenshotBtn_Click(object s, RoutedEventArgs e)
+    {
+        var png = KvmRenderer.CaptureScreenshot();
+        if (png is null) return;
+        var ts   = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+            "WinKVM", $"WinKVM_{ts}.png");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllBytes(path, png);
+    }
+
+    private async void PasteBtn_Click(object s, RoutedEventArgs e)
+    {
+        var text = await GetClipboardTextAsync();
+        if (!string.IsNullOrEmpty(text))
+            await _session.SendTextAsync(text);
+    }
+
+    private static async Task<string?> GetClipboardTextAsync()
+    {
+        try
+        {
+            var data = Clipboard.GetContent();
+            if (data.Contains(StandardDataFormats.Text))
+                return await data.GetTextAsync();
+        }
+        catch { }
+        return null;
+    }
+
+    // ── Keyboard input ────────────────────────────────────────────────────────
+
+    private void KvmRenderer_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (_session.State != SessionState.Connected) return;
+        if (KeyboardHandler.RaritanKeyCode(e.Key) is { } code)
+        {
+            _ = _session.SendKeyEventAsync(code, true);
+            e.Handled = true;
+        }
+    }
+
+    private void KvmRenderer_KeyUp(object sender, KeyRoutedEventArgs e)
+    {
+        if (_session.State != SessionState.Connected) return;
+        if (KeyboardHandler.RaritanKeyCode(e.Key) is { } code)
+        {
+            _ = _session.SendKeyEventAsync(code, false);
+            e.Handled = true;
+        }
+    }
+
+    // ── Mouse input ───────────────────────────────────────────────────────────
+
+    private void KvmRenderer_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (_session.State != SessionState.Connected) return;
+        SendMouseEvent(e, dragButton: 0);
+    }
+
+    private void KvmRenderer_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (_session.State != SessionState.Connected) return;
+        KvmRenderer.CapturePointer(e.Pointer);
+        SendMouseEvent(e);
+    }
+
+    private void KvmRenderer_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (_session.State != SessionState.Connected) return;
+        KvmRenderer.ReleasePointerCapture(e.Pointer);
+        SendMouseEvent(e);
+    }
+
+    private void KvmRenderer_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (_session.State != SessionState.Connected) return;
+        var pt    = e.GetCurrentPoint(KvmRenderer);
+        var (x, y) = MouseHandler.FramebufferCoords(pt.Position.X, pt.Position.Y,
+            KvmRenderer.ActualWidth, KvmRenderer.ActualHeight,
+            _session.FramebufferWidth, _session.FramebufferHeight);
+        short z = (short)(pt.Properties.MouseWheelDelta / 120);
+        _ = _session.SendScrollEventAsync(x, y, 0, z);
+    }
+
+    private void SendMouseEvent(PointerRoutedEventArgs e, byte dragButton = 0xFF)
+    {
+        var pt   = e.GetCurrentPoint(KvmRenderer);
+        var mask = dragButton == 0xFF ? MouseHandler.ButtonMask(pt.Properties) : dragButton;
+        var (x, y) = MouseHandler.FramebufferCoords(pt.Position.X, pt.Position.Y,
+            KvmRenderer.ActualWidth, KvmRenderer.ActualHeight,
+            _session.FramebufferWidth, _session.FramebufferHeight);
+        _ = _session.SendPointerEventAsync(x, y, mask);
+    }
+}

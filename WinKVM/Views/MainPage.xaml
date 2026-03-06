@@ -1,0 +1,85 @@
+<Page
+    x:Class="WinKVM.Views.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:WinKVM.Views"
+    xmlns:rendering="using:WinKVM.Rendering">
+
+    <Grid RowDefinitions="Auto,*">
+
+        <!-- Toolbar -->
+        <CommandBar Grid.Row="0" DefaultLabelPosition="Collapsed"
+                    Background="{ThemeResource SystemControlAcrylicWindowBrush}">
+            <AppBarButton x:Name="DisconnectBtn" Icon="Cancel"     Label="Disconnect"      Click="DisconnectBtn_Click"/>
+            <AppBarButton x:Name="CtrlAltDelBtn" Icon="Keyboard"   Label="Ctrl-Alt-Del"    Click="CtrlAltDelBtn_Click"/>
+            <AppBarSeparator/>
+            <AppBarButton x:Name="ScreenshotBtn" Icon="Camera"     Label="Screenshot"      Click="ScreenshotBtn_Click"/>
+            <AppBarSeparator/>
+            <AppBarButton x:Name="SendTextBtn"   Icon="Edit"       Label="Send Text"       Click="SendTextBtn_Click"/>
+            <AppBarButton x:Name="PasteBtn"      Icon="Paste"      Label="Paste Clipboard" Click="PasteBtn_Click"/>
+            <AppBarSeparator/>
+            <AppBarButton x:Name="AIAgentBtn"    Icon="People"     Label="AI Agent"        Click="AIAgentBtn_Click"/>
+            <AppBarSeparator/>
+            <AppBarButton x:Name="DiagnosticsBtn" Icon="Setting"   Label="Diagnostics"     Click="DiagnosticsBtn_Click"/>
+            <CommandBar.SecondaryCommands>
+                <AppBarButton Label="Settings" Click="SettingsBtn_Click"/>
+            </CommandBar.SecondaryCommands>
+            <CommandBar.Content>
+                <TextBlock x:Name="StatusText" VerticalAlignment="Center" Margin="8,0"
+                           Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                           FontSize="12"/>
+            </CommandBar.Content>
+        </CommandBar>
+
+        <!-- Main content area -->
+        <Grid Grid.Row="1">
+            <!-- Login view (shown when disconnected) -->
+            <local:LoginPage x:Name="LoginPage" Visibility="Visible"/>
+
+            <!-- Connecting/authenticating spinner -->
+            <StackPanel x:Name="ConnectingPanel" Visibility="Collapsed"
+                        HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
+                <ProgressRing IsActive="True" Width="48" Height="48"/>
+                <TextBlock x:Name="ConnectingText" HorizontalAlignment="Center"/>
+            </StackPanel>
+
+            <!-- Error view -->
+            <StackPanel x:Name="ErrorPanel" Visibility="Collapsed"
+                        HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
+                <FontIcon Glyph="&#xE783;" FontSize="48" Foreground="{ThemeResource SystemFillColorCriticalBrush}"/>
+                <TextBlock x:Name="ErrorText" TextWrapping="Wrap" TextAlignment="Center" MaxWidth="400"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="8">
+                    <Button x:Name="ReconnectBtn" Content="Reconnect" Style="{StaticResource AccentButtonStyle}"
+                            Click="ReconnectBtn_Click"/>
+                    <Button Content="Back to Login" Click="BackToLoginBtn_Click"/>
+                </StackPanel>
+            </StackPanel>
+
+            <!-- Connected: KVM view + optional AI panel -->
+            <Grid x:Name="ConnectedPanel" Visibility="Collapsed" ColumnDefinitions="*,Auto">
+                <!-- D3D11 framebuffer renderer -->
+                <rendering:D3DFramebufferControl x:Name="KvmRenderer" Grid.Column="0"
+                    PointerMoved="KvmRenderer_PointerMoved"
+                    PointerPressed="KvmRenderer_PointerPressed"
+                    PointerReleased="KvmRenderer_PointerReleased"
+                    PointerWheelChanged="KvmRenderer_PointerWheelChanged"
+                    KeyDown="KvmRenderer_KeyDown"
+                    KeyUp="KvmRenderer_KeyUp"/>
+
+                <!-- AI chat panel (collapsible) -->
+                <local:AIChatPanel x:Name="AiPanel" Grid.Column="1" Width="320" Visibility="Collapsed"/>
+            </Grid>
+        </Grid>
+
+        <!-- Certificate trust dialog -->
+        <ContentDialog x:Name="CertDialog" Title="Certificate Trust"
+                       PrimaryButtonText="Trust" CloseButtonText="Reject"
+                       DefaultButton="Close">
+            <TextBlock x:Name="CertDialogText" TextWrapping="Wrap"/>
+        </ContentDialog>
+
+        <!-- Send text flyout -->
+        <local:SendTextView x:Name="SendTextFlyout"/>
+
+    </Grid>
+</Page>

@@ -1,0 +1,64 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows10.0.22621.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
+    <RootNamespace>WinKVM</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64;arm64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <PublishProfile>Properties\PublishProfiles\win10-$(Platform).pubxml</PublishProfile>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <WindowsPackageType>None</WindowsPackageType>
+    <!-- NPU/GPU: Enable DirectML support -->
+    <GenerateAppxPackageOnBuild>false</GenerateAppxPackageOnBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WinUI 3 -->
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250401001" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" PrivateAssets="all" />
+
+    <!-- Direct3D 11 + DXGI + D3DCompiler for GPU rendering -->
+    <PackageReference Include="Vortice.Direct3D11" Version="3.9.0" />
+    <PackageReference Include="Vortice.DXGI" Version="3.9.0" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.9.0" />
+
+    <!-- DirectML for NPU/GPU ML acceleration (OCR, ICT decode offload) -->
+    <PackageReference Include="Microsoft.AI.DirectML" Version="1.15.4" />
+
+    <!-- Tesseract OCR fallback -->
+    <PackageReference Include="Tesseract" Version="5.2.0" />
+
+    <!-- JSON serialization -->
+    <PackageReference Include="System.Text.Json" Version="9.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- HLSL shaders: compile to CSO at build time -->
+    <None Update="Rendering\Shaders\YCbCr.hlsl">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Rendering\Shaders\HextileFill.hlsl">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Rendering\Shaders\Display.hlsl">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Rendering\Shaders\ICTDequant.hlsl">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <!-- Tesseract data -->
+    <None Update="Assets\tessdata\eng.traineddata">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Manifest Include="$(ApplicationManifest)" />
+  </ItemGroup>
+</Project>

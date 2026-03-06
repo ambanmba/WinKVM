@@ -1,0 +1,11 @@
+<Window
+    x:Class="WinKVM.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:WinKVM"
+    xmlns:views="using:WinKVM.Views"
+    Title="WinKVM">
+    <Grid>
+        <views:MainPage x:Name="MainPageContent" />
+    </Grid>
+</Window>

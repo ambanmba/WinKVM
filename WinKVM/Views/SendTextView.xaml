@@ -1,0 +1,14 @@
+<UserControl
+    x:Class="WinKVM.Views.SendTextView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <StackPanel Width="320" Padding="16" Spacing="8">
+        <TextBlock Text="Send Text to Remote" Style="{StaticResource SubtitleTextBlockStyle}"/>
+        <TextBox x:Name="TextInput" Header="Text" PlaceholderText="Type text to send..."
+                 AcceptsReturn="True" Height="120" TextWrapping="Wrap"/>
+        <Button Content="Send" HorizontalAlignment="Stretch"
+                Style="{StaticResource AccentButtonStyle}" Click="SendBtn_Click"/>
+        <ProgressBar x:Name="SendProgress" Minimum="0" Maximum="100" Visibility="Collapsed"/>
+    </StackPanel>
+</UserControl>

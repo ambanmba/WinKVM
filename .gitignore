@@ -1,0 +1,39 @@
+## .NET / C#
+bin/
+obj/
+*.user
+*.suo
+.vs/
+packages/
+*.nupkg
+*.snupkg
+
+## Visual Studio
+.vscode/
+*.DotSettings.user
+TestResults/
+
+## WinUI / MSIX packaging
+AppPackages/
+BundleArtifacts/
+*.msixupload
+
+## Build outputs
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+ARM64/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+
+## Secrets
+*.pfx
+*.p12
+appsettings.Local.json
+
+## OS
+.DS_Store
+Thumbs.db

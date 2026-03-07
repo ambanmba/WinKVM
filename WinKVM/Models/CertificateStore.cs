@@ -1,55 +1,43 @@
 using System.Security.Cryptography;
 using Windows.Storage;
 
-namespace WinKVM.Models;
+namespace WinKVM.Protocol;
 
-// ── Re-export for Protocol layer ────────────────────────────────────────────
-namespace WinKVM.Protocol
+/// Discriminated union for certificate check results.
+public abstract record CertCheckResult
 {
-    public enum CertCheckResult
-    {
-        Unknown,
-        Trusted,
-        FirstUse,
-        Changed,
-    }
-
-    // Discriminated-union-style helpers
-    public record CertCheckResultTrusted  : CertCheckResult { public static implicit operator CertCheckResult(CertCheckResultTrusted  _) => CertCheckResult.Trusted; }
-    public record CertCheckResultFirstUse(string Fingerprint);
-    public record CertCheckResultChanged(string OldFingerprint, string NewFingerprint);
+    public sealed record Trusted : CertCheckResult;
+    public sealed record FirstUse(string Fingerprint) : CertCheckResult;
+    public sealed record Changed(string OldFingerprint, string NewFingerprint) : CertCheckResult;
 }
 
-namespace WinKVM.Protocol
+/// Trust-on-First-Use certificate store backed by Windows ApplicationData.
+public static class CertificateStore
 {
-    /// Trust-on-First-Use certificate store backed by Windows ApplicationData.
-    public static class CertificateStore
+    private const string Prefix = "cert_";
+
+    /// Compute a SHA-256 fingerprint as colon-separated hex (matches Swift format).
+    public static string Fingerprint(byte[] derData)
     {
-        private const string Prefix = "cert_";
+        var hash = SHA256.HashData(derData);
+        return string.Join(":", hash.Select(b => b.ToString("X2")));
+    }
 
-        /// Compute a SHA-256 fingerprint as colon-separated hex (matches Swift format).
-        public static string Fingerprint(byte[] derData)
-        {
-            var hash = SHA256.HashData(derData);
-            return string.Join(":", hash.Select(b => b.ToString("X2")));
-        }
+    public static CertCheckResult Check(string host, ushort port, string fingerprint)
+    {
+        var key      = Prefix + $"{host}:{port}";
+        var settings = ApplicationData.Current.LocalSettings;
+        if (settings.Values[key] is not string stored)
+            return new CertCheckResult.FirstUse(fingerprint);
 
-        public static object Check(string host, ushort port, string fingerprint)
-        {
-            var key      = Prefix + $"{host}:{port}";
-            var settings = ApplicationData.Current.LocalSettings;
-            if (settings.Values[key] is not string stored)
-                return new CertCheckResultFirstUse(fingerprint);
+        return stored == fingerprint
+            ? new CertCheckResult.Trusted()
+            : new CertCheckResult.Changed(stored, fingerprint);
+    }
 
-            return stored == fingerprint
-                ? (object)CertCheckResult.Trusted
-                : new CertCheckResultChanged(stored, fingerprint);
-        }
-
-        public static void Trust(string host, ushort port, string fingerprint)
-        {
-            var key = Prefix + $"{host}:{port}";
-            ApplicationData.Current.LocalSettings.Values[key] = fingerprint;
-        }
+    public static void Trust(string host, ushort port, string fingerprint)
+    {
+        var key = Prefix + $"{host}:{port}";
+        ApplicationData.Current.LocalSettings.Values[key] = fingerprint;
     }
 }

@@ -26,7 +26,7 @@ public sealed class YCbCrPlanes : IDisposable
     public unsafe byte* Cb => _disposed ? null : (byte*)_cbBuf;
     public unsafe byte* Cr => _disposed ? null : (byte*)_crBuf;
 
-    public YCbCrPlanes(int width, int height)
+    public unsafe YCbCrPlanes(int width, int height)
     {
         Width  = width;
         Height = height;

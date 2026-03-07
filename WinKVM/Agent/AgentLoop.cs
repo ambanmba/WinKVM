@@ -225,32 +225,32 @@ public sealed class AgentLoop
 
     private void SetState(AgentState s) { State = s; StateChanged?.Invoke(); }
 
-    private static string SystemPrompt(int w, int h) => $"""
+    private static string SystemPrompt(int w, int h) => $$"""
         You are an AI agent controlling a remote computer through a KVM device.
         You see the screen through OCR text and optional screenshots.
 
         SCREEN FORMAT:
         - Screen divided into TOP BAR, MAIN, and BOTTOM BAR regions
         - Elements from OCR text with approximate positions
-        - Coordinates are framebuffer pixels. Resolution: {w}x{h}
+        - Coordinates are framebuffer pixels. Resolution: {{w}}x{{h}}
 
         GUI INTERACTION:
         - To click a button: use coordinates near the text centre
         - To fill a text field: click the field first, then use "type"
         - After ANY click or type, add a wait (1-2s) then screenshot to verify
 
-        Respond with JSON: {{ "thinking": "...", "actions": [...], "message": "..." }}
+        Respond with JSON: { "thinking": "...", "actions": [...], "message": "..." }
 
         Available actions:
-          {{"action":"click","x":500,"y":300,"button":"left"}}
-          {{"action":"double_click","x":500,"y":300}}
-          {{"action":"type","text":"hello"}}
-          {{"action":"key_combo","keys":["ctrl","c"]}}
-          {{"action":"scroll","x":500,"y":300,"direction":"down","amount":3}}
-          {{"action":"move_mouse","x":500,"y":300}}
-          {{"action":"wait","seconds":2}}
-          {{"action":"screenshot"}}
-          {{"action":"done","summary":"Task complete"}}
+          {"action":"click","x":500,"y":300,"button":"left"}
+          {"action":"double_click","x":500,"y":300}
+          {"action":"type","text":"hello"}
+          {"action":"key_combo","keys":["ctrl","c"]}
+          {"action":"scroll","x":500,"y":300,"direction":"down","amount":3}
+          {"action":"move_mouse","x":500,"y":300}
+          {"action":"wait","seconds":2}
+          {"action":"screenshot"}
+          {"action":"done","summary":"Task complete"}
         """;
 
     private static string DescribeAction(AIAction a) => a switch

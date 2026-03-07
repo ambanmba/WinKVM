@@ -1,3 +1,5 @@
+using WinKVM.Protocol;
+
 namespace WinKVM.Framebuffer;
 
 /// GPU-direct commands produced by hextile decoding.

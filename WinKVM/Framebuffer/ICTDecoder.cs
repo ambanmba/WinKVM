@@ -63,9 +63,6 @@ public sealed class ICTDecoder
     // Populated on first use from standard JPEG Annex K tables.
     private HuffTable? _dcLumi, _dcChroma, _acLumi, _acChroma;
 
-    // ── HIVE bitstream reader ────────────────────────────────────────────────
-    private BitReader _bits;
-
     // ── Output buffers ───────────────────────────────────────────────────────
     // Reused to avoid per-frame allocation. Sized for maximum 2560×1440.
     private byte[]? _yBuf, _cbBuf, _crBuf;
@@ -83,7 +80,7 @@ public sealed class ICTDecoder
         EnsureHuffTables();
         EnsureOutputBuffers(frameWidth, frameHeight);
 
-        _bits = new BitReader(data);
+        var bits = new BitReader(data);
 
         int tilesX = (frameWidth  + 15) / 16;
         int tilesY = (frameHeight + 15) / 16;
@@ -97,22 +94,22 @@ public sealed class ICTDecoder
         for (int tileX = 0; tileX < tilesX; tileX++)
         {
             // Read HIVE skip count
-            int skip = _bits.ReadHiveSkip();
+            int skip = bits.ReadHiveSkip();
 
             // Luma (4 8×8 blocks per 16×16 tile)
             for (int b = 0; b < 4; b++)
             {
-                if (!DecodeBlock(_dcLumi!, _acLumi!, _qLumi, ref dcY, _coeffs, _idct)) return null;
+                if (!DecodeBlock(ref bits, _dcLumi!, _acLumi!, _qLumi, ref dcY, _coeffs, _idct)) return null;
                 int bx = (b & 1) * 8, by = (b >> 1) * 8;
                 WriteLumaBlock(tileX * 16 + bx, tileY * 16 + by, frameWidth, frameHeight);
             }
 
             // Cb
-            if (!DecodeBlock(_dcChroma!, _acChroma!, _qChroma, ref dcCb, _coeffs, _idct)) return null;
+            if (!DecodeBlock(ref bits, _dcChroma!, _acChroma!, _qChroma, ref dcCb, _coeffs, _idct)) return null;
             WriteChromaBlock(_cbBuf!, tileX, tileY, (frameWidth + 1) / 2, (frameHeight + 1) / 2);
 
             // Cr
-            if (!DecodeBlock(_dcChroma!, _acChroma!, _qChroma, ref dcCr, _coeffs, _idct)) return null;
+            if (!DecodeBlock(ref bits, _dcChroma!, _acChroma!, _qChroma, ref dcCr, _coeffs, _idct)) return null;
             WriteChromaBlock(_crBuf!, tileX, tileY, (frameWidth + 1) / 2, (frameHeight + 1) / 2);
 
             _ = skip; // skip is used by the bitstream reader internally
@@ -167,16 +164,16 @@ public sealed class ICTDecoder
         _cStride = (w + 1) / 2;
     }
 
-    private bool DecodeBlock(HuffTable dcTable, HuffTable acTable,
+    private bool DecodeBlock(ref BitReader bits, HuffTable dcTable, HuffTable acTable,
                               float[] qTable, ref int dcPred,
                               float[] coeffs, float[] idct)
     {
         Array.Clear(coeffs);
 
         // DC coefficient
-        int dcSize = _bits.DecodeHuff(dcTable);
+        int dcSize = bits.DecodeHuff(dcTable);
         if (dcSize < 0) return false;
-        int dcVal  = dcSize > 0 ? _bits.ReadSignedBits(dcSize) : 0;
+        int dcVal  = dcSize > 0 ? bits.ReadSignedBits(dcSize) : 0;
         dcPred    += dcVal;
         coeffs[0]  = dcPred * qTable[0];
 
@@ -184,7 +181,7 @@ public sealed class ICTDecoder
         int k = 1;
         while (k < 64)
         {
-            int sym = _bits.DecodeHuff(acTable);
+            int sym = bits.DecodeHuff(acTable);
             if (sym < 0) return false;
             if (sym == 0x00) break; // EOB
             if (sym == 0xF0) { k += 16; continue; } // ZRL
@@ -192,7 +189,7 @@ public sealed class ICTDecoder
             int size = sym & 0xF;
             k += run;
             if (k >= 64) return false;
-            int ac = _bits.ReadSignedBits(size);
+            int ac = bits.ReadSignedBits(size);
             coeffs[Zigzag[k]] = ac * qTable[k];
             k++;
         }

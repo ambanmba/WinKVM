@@ -37,4 +37,12 @@ Port of SwiftKVM (Swift/Metal/macOS) to C#/WinUI 3/Direct3D 11/Windows.
 ## Build requirements
 - Visual Studio 2022 + Windows App SDK workload
 - .NET 9 + Windows 10 SDK 22621+
-- NuGet: Microsoft.WindowsAppSDK, Vortice.Direct3D11, Vortice.DXGI, Vortice.D3DCompiler, Microsoft.AI.DirectML, Tesseract
+- NuGet: Microsoft.WindowsAppSDK 1.7, Vortice.Direct3D11 3.8.3, Vortice.DXGI 3.8.3, Vortice.D3DCompiler 3.8.3, Microsoft.AI.DirectML, Tesseract, System.Drawing.Common
+
+## CLI build (ARM64 host)
+On ARM64 machines, build with `-p:Platform=x64` — the WinAppSDK XamlCompiler.exe is x64-only:
+```
+dotnet build WinKVM/WinKVM.csproj -c Debug -p:Platform=x64
+dotnet run --project WinKVM/WinKVM.csproj -c Debug -p:Platform=x64
+```
+Visual Studio IDE builds work for both x64 and ARM64.

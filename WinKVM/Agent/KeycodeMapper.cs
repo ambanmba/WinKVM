@@ -41,11 +41,8 @@ public static class KeycodeMapper
     public static ushort? KeyCode(string name)
         => NameToCode.TryGetValue(name, out var c) ? c : null;
 
-    // Char → (keycode, needsShift) pairs for text injection
-    private static readonly Dictionary<char, (ushort code, bool shift)> CharMap = new()
-    {
-        ['a']='a'-0, ['b']='b'-0, // populated below
-    };
+    // Char → (keycode, needsShift) pairs for text injection — populated by static constructor
+    private static readonly Dictionary<char, (ushort code, bool shift)> CharMap = new();
 
     static KeycodeMapper()
     {

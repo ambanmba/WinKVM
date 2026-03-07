@@ -68,7 +68,6 @@ public sealed class ERICSession : INotifyPropertyChanged
     private Task? _receiveTask;
 
     // Decoders
-    private readonly RawDecoder     _rawDecoder     = new();
     private readonly HextileDecoder _hextileDecoder = new();
     private readonly ICTDecoder     _ictDecoder     = new();
 

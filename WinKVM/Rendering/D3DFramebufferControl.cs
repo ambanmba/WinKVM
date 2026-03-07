@@ -40,6 +40,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
     private ID3D11Texture2D?          _displayTex;
     private ID3D11ShaderResourceView? _displaySRV;
     private ID3D11RenderTargetView?   _displayRTV;
+    private ID3D11UnorderedAccessView? _displayUAV;
     private int _displayW, _displayH;
 
     // YCbCr plane textures (R8 each)
@@ -49,7 +50,6 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
     // Fill command buffer
     private ID3D11Buffer?             _fillCmdBuf;
     private ID3D11ShaderResourceView? _fillCmdSRV;
-    private ID3D11UnorderedAccessView? _displayUAV;
 
     // Reusable staging texture for CPU→GPU uploads
     private ID3D11Texture2D?          _stagingTex;
@@ -90,8 +90,8 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
         var desc = new SwapChainDescription1
         {
-            Width       = Math.Max(1, (int)ActualWidth),
-            Height      = Math.Max(1, (int)ActualHeight),
+            Width       = (uint)Math.Max(1, (int)ActualWidth),
+            Height      = (uint)Math.Max(1, (int)ActualHeight),
             Format      = Format.B8G8R8A8_UNorm,
             Stereo      = false,
             SampleDescription = new SampleDescription(1, 0),
@@ -104,8 +104,8 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
         _swapChain = dxgiFactory.CreateSwapChainForComposition(_device!, desc);
 
-        // Connect swap chain to this SwapChainPanel
-        var nativePanel = this.As<ISwapChainPanelNative>();
+        // Connect swap chain to this SwapChainPanel via ISwapChainPanelNative COM interop
+        var nativePanel = (ISwapChainPanelNative)(object)this;
         nativePanel.SetSwapChain(_swapChain);
 
         CreateRTV();
@@ -124,7 +124,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
     {
         if (w <= 0 || h <= 0) return;
         _rtv?.Dispose(); _rtv = null;
-        _swapChain!.ResizeBuffers(2, w, h, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
+        _swapChain!.ResizeBuffers(2, (uint)w, (uint)h, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
         CreateRTV();
     }
 
@@ -148,7 +148,6 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
         var vsBytes        = CompileHlsl("YCbCr.hlsl",      "vs_5_0", "VS");
         var ycbcrPSBytes   = CompileHlsl("YCbCr.hlsl",      "ps_5_0", "PS");
-        var displayVSBytes = CompileHlsl("Display.hlsl",    "vs_5_0", "VS");
         var displayPSBytes = CompileHlsl("Display.hlsl",    "ps_5_0", "PS");
         var fillCSBytes    = CompileHlsl("HextileFill.hlsl","cs_5_0", "CS");
         var ictCSBytes     = CompileHlsl("ICTDequant.hlsl", "cs_5_0", "CS");
@@ -164,15 +163,17 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
     {
         var desc = new SamplerDescription
         {
-            Filter        = Filter.MinMagMipLinear,
-            AddressU      = TextureAddressMode.Clamp,
-            AddressV      = TextureAddressMode.Clamp,
-            AddressW      = TextureAddressMode.Clamp,
+            Filter   = Filter.MinMagMipLinear,
+            AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp,
         };
         _linearSampler = _device!.CreateSamplerState(desc);
     }
 
     // ── Texture management ───────────────────────────────────────────────────
+
+    public void EnsureTexture(int w, int h) => EnsureDisplayTexture(w, h);
 
     private void EnsureDisplayTexture(int w, int h)
     {
@@ -182,11 +183,11 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
         var desc = new Texture2DDescription
         {
-            Width = w, Height = h, MipLevels = 1, ArraySize = 1,
+            Width  = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1,
             Format = Format.B8G8R8A8_UNorm,
             SampleDescription = new SampleDescription(1, 0),
-            Usage = ResourceUsage.Default,
-            BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget | BindFlags.UnorderedAccess,
+            Usage      = ResourceUsage.Default,
+            BindFlags  = BindFlags.ShaderResource | BindFlags.RenderTarget | BindFlags.UnorderedAccess,
         };
         _displayTex = _device!.CreateTexture2D(desc);
         _displaySRV = _device.CreateShaderResourceView(_displayTex);
@@ -198,8 +199,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
     private void EnsureYCbCrTextures(int w, int h)
     {
         int cw = (w + 1) / 2, ch = (h + 1) / 2;
-        // Recreate only when size changes
-        if (_yTex is not null && _yTex.Description.Width == w && _yTex.Description.Height == h) return;
+        if (_yTex is not null && _yTex.Description.Width == (uint)w && _yTex.Description.Height == (uint)h) return;
 
         DisposeYCbCrTextures();
         _yTex  = MakeR8Texture(w,  h);  _ySRV  = _device!.CreateShaderResourceView(_yTex);
@@ -209,12 +209,12 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
     private ID3D11Texture2D MakeR8Texture(int w, int h) => _device!.CreateTexture2D(new Texture2DDescription
     {
-        Width = w, Height = h, MipLevels = 1, ArraySize = 1,
+        Width  = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1,
         Format = Format.R8_UNorm,
         SampleDescription = new SampleDescription(1, 0),
-        Usage = ResourceUsage.Dynamic,
-        BindFlags = BindFlags.ShaderResource,
-        CpuAccessFlags = CpuAccessFlags.Write,
+        Usage          = ResourceUsage.Dynamic,
+        BindFlags      = BindFlags.ShaderResource,
+        CPUAccessFlags = CpuAccessFlags.Write,
     });
 
     private void DisposeYCbCrTextures()
@@ -236,12 +236,10 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
         if (dirtyRects is null || dirtyRects.Count == 0)
         {
-            // Full upload via staging texture
             UploadRegion(fb, 0, 0, fb.Width, fb.Height);
         }
         else
         {
-            // Coalesce dirty rects into a single bounding box
             int minX = fb.Width, minY = fb.Height, maxX = 0, maxY = 0;
             foreach (var (rx, ry, rw, rh) in dirtyRects)
             {
@@ -260,11 +258,9 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
         h = Math.Min(h, fb.Height - y);
         if (w <= 0 || h <= 0) return;
 
-        // Use UpdateSubresource for managed VRAM (discrete GPU)
-        // On integrated/UMA adapters this is a direct DMA copy.
         var box = new Box(x, y, 0, x + w, y + h, 1);
         byte* srcRow = fb.RowPointer(y) + x * 4;
-        _ctx!.UpdateSubresource(_displayTex!, 0, box, (nint)srcRow, fb.BytesPerRow, 0);
+        _ctx!.UpdateSubresource(_displayTex!, 0u, box, (nint)srcRow, (uint)fb.BytesPerRow, 0u);
     }
 
     /// Upload YCbCr planes and render via GPU YCbCr→RGB shader.
@@ -309,21 +305,21 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
         FbWidth = fbW; FbHeight = fbH;
         EnsureDisplayTexture(fbW, fbH);
 
-        // Upload fill commands to a structured buffer
         int stride = Marshal.SizeOf<FillCommand>();
-        var bufDesc = new BufferDescription
-        {
-            ByteWidth           = (uint)(fills.Length * stride),
-            Usage               = ResourceUsage.Dynamic,
-            BindFlags           = BindFlags.ShaderResource,
-            CpuAccessFlags      = CpuAccessFlags.Write,
-            MiscFlags           = ResourceOptionFlags.BufferStructured,
-            StructureByteStride = (uint)stride,
-        };
+        uint byteWidth = (uint)(fills.Length * stride);
 
-        if (_fillCmdBuf is null || _fillCmdBuf.Description.ByteWidth < bufDesc.ByteWidth)
+        if (_fillCmdBuf is null || _fillCmdBuf.Description.ByteWidth < byteWidth)
         {
             _fillCmdBuf?.Dispose(); _fillCmdSRV?.Dispose();
+            var bufDesc = new BufferDescription
+            {
+                ByteWidth           = byteWidth,
+                Usage               = ResourceUsage.Dynamic,
+                BindFlags           = BindFlags.ShaderResource,
+                CPUAccessFlags      = CpuAccessFlags.Write,
+                MiscFlags           = ResourceOptionFlags.BufferStructured,
+                StructureByteStride = (uint)stride,
+            };
             _fillCmdBuf = _device.CreateBuffer(bufDesc);
             _fillCmdSRV = _device.CreateShaderResourceView(_fillCmdBuf);
         }
@@ -337,7 +333,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
         _ctx.CSSetShaderResources(0, [_fillCmdSRV!]);
         _ctx.CSSetUnorderedAccessViews(0, [_displayUAV!]);
         _ctx.CSSetConstantBuffers(0, [MakeConstantBuffer(count)]);
-        _ctx.Dispatch((fills.Length + 63) / 64, 1, 1);
+        _ctx.Dispatch((uint)((fills.Length + 63) / 64), 1, 1);
         _ctx.CSSetShader(null!);
 
         Render();
@@ -345,9 +341,14 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
     private ID3D11Buffer MakeConstantBuffer(uint value)
     {
-        var data   = new uint[] { value, 0, 0, 0 };
-        var desc   = new BufferDescription { ByteWidth = 16, Usage = ResourceUsage.Default, BindFlags = BindFlags.ConstantBuffer };
-        return _device!.CreateBuffer(desc, MemoryMarshal.AsBytes(data.AsSpan()));
+        var data = new uint[] { value, 0, 0, 0 };
+        var desc = new BufferDescription
+        {
+            ByteWidth = 16u,
+            Usage     = ResourceUsage.Default,
+            BindFlags = BindFlags.ConstantBuffer,
+        };
+        return _device!.CreateBuffer(data.AsSpan(), desc);
     }
 
     // ── Render (display texture → swap chain) ────────────────────────────────
@@ -357,7 +358,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
         if (_ctx is null || _rtv is null || _displaySRV is null) return;
 
         var sc = _swapChain!.Description1;
-        var vp = new Viewport(0, 0, sc.Width, sc.Height);
+        var vp = new Viewport(0, 0, (float)sc.Width, (float)sc.Height);
 
         _ctx.OMSetRenderTargets(_rtv);
         _ctx.RSSetViewport(vp);
@@ -378,9 +379,10 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
         var desc = _displayTex.Description with
         {
-            Usage = ResourceUsage.Staging,
-            BindFlags = BindFlags.None,
-            CpuAccessFlags = CpuAccessFlags.Read,
+            Usage          = ResourceUsage.Staging,
+            BindFlags      = BindFlags.None,
+            CPUAccessFlags = CpuAccessFlags.Read,
+            MiscFlags      = ResourceOptionFlags.None,
         };
         using var staging = _device.CreateTexture2D(desc);
         _ctx.CopyResource(staging, _displayTex);
@@ -396,7 +398,6 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
         }
         _ctx.Unmap(staging, 0);
 
-        // Encode as PNG using System.Drawing or WIC
         using var ms = new MemoryStream();
         using var bmp = new System.Drawing.Bitmap(w, h, w * 4,
             System.Drawing.Imaging.PixelFormat.Format32bppArgb,

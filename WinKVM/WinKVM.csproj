@@ -24,15 +24,18 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" PrivateAssets="all" />
 
     <!-- Direct3D 11 + DXGI + D3DCompiler for GPU rendering -->
-    <PackageReference Include="Vortice.Direct3D11" Version="3.9.0" />
-    <PackageReference Include="Vortice.DXGI" Version="3.9.0" />
-    <PackageReference Include="Vortice.D3DCompiler" Version="3.9.0" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
 
     <!-- DirectML for NPU/GPU ML acceleration (OCR, ICT decode offload) -->
     <PackageReference Include="Microsoft.AI.DirectML" Version="1.15.4" />
 
     <!-- Tesseract OCR fallback -->
     <PackageReference Include="Tesseract" Version="5.2.0" />
+
+    <!-- System.Drawing for JPEG encoding in ScreenshotEncoder -->
+    <PackageReference Include="System.Drawing.Common" Version="9.0.5" />
 
     <!-- JSON serialization -->
     <PackageReference Include="System.Text.Json" Version="9.0.5" />

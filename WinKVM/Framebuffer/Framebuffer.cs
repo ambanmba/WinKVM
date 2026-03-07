@@ -18,7 +18,7 @@ public sealed class KvmFramebuffer : IDisposable
 
     public unsafe byte* Pixels => _disposed ? null : (byte*)_pixels;
 
-    public KvmFramebuffer(int width, int height)
+    public unsafe KvmFramebuffer(int width, int height)
     {
         if (width <= 0 || height <= 0)
             throw new ArgumentException("Framebuffer dimensions must be positive");
@@ -29,7 +29,7 @@ public sealed class KvmFramebuffer : IDisposable
         NativeMemory.Clear((void*)_pixels, (nuint)TotalBytes);
     }
 
-    public void Dispose()
+    public unsafe void Dispose()
     {
         if (_disposed) return;
         _disposed = true;

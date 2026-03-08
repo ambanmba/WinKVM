@@ -53,6 +53,29 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
     /// CAS sharpness 0.0–1.0 (0 = off, 0.6 = default). Set from UI.
     public float Sharpness { get; set; } = 0.6f;
 
+    // ── NPU sharpening (Windows.AI.MachineLearning → Hexagon NPU) ────────────
+    private SrPipeline? _srPipeline;
+    private volatile bool _npuBusy;
+
+    /// When true: NPU (WinML) sharpening; when false: GPU (CAS) sharpening.
+    private bool _npuEnabled;
+    public bool NpuSharpenEnabled
+    {
+        get => _npuEnabled;
+        set
+        {
+            _npuEnabled = value;
+            if (value && _srPipeline is null && _device is not null)
+                InitNpuAsync();
+        }
+    }
+
+    private void InitNpuAsync()
+    {
+        _srPipeline = new SrPipeline();
+        _ = _srPipeline.InitAsync();  // fire-and-forget; IsAvailable gates usage
+    }
+
     // Display texture (BGRA8, persistent)
     private ID3D11Texture2D?          _displayTex;
     private ID3D11ShaderResourceView? _displaySRV;
@@ -425,11 +448,22 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         // Unbind display texture from any lingering RTV before using it as SRV
         _ctx.OMSetRenderTargets((ID3D11RenderTargetView?)null);
 
+        // ── NPU sharpening pass (Hexagon NPU via WinML) ───────────────────────
+        // Triggered when NpuSharpenEnabled=true and pipeline is ready.
+        // Modifies _displayTex in-place; one-frame latency is acceptable for KVM.
+        if (_npuEnabled && _srPipeline is { IsAvailable: true } sr && !_npuBusy)
+        {
+            _npuBusy = true;
+            _ = sr.EnhanceInPlaceAsync(_ctx, _device!, _displayTex!,
+                                        _displayW, _displayH)
+                  .ContinueWith(_ => { _npuBusy = false; });
+        }
+
         // ── CAS sharpening pass (Adreno GPU) ─────────────────────────────────
         // Reads _displayTex (YCbCr-converted frame) → writes _casOutTex.
-        // Skipped when sharpness is zero or resources unavailable.
+        // Skipped when NPU mode is active, sharpness is zero, or unavailable.
         var presentSRV = _displaySRV; // default: present unsharpened
-        if (Sharpness > 0f && _casCS is not null && _casOutUAV is not null && _casCB is not null)
+        if (!_npuEnabled && Sharpness > 0f && _casCS is not null && _casOutUAV is not null && _casCB is not null)
         {
             // Update sharpness constant via Map/WriteDiscard (Dynamic CB)
             unsafe
@@ -523,6 +557,7 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _fillCmdSRV?.Dispose(); _fillCmdBuf?.Dispose();
         _displayUAV?.Dispose(); _displayRTV?.Dispose();
         _displaySRV?.Dispose(); _displayTex?.Dispose();
+        _srPipeline?.Dispose();
         _casCB?.Dispose(); _casOutUAV?.Dispose(); _casOutSRV?.Dispose(); _casOutTex?.Dispose();
         _noCullRS?.Dispose(); _linearSampler?.Dispose();
         _ictCS?.Dispose(); _fillCS?.Dispose(); _casCS?.Dispose();

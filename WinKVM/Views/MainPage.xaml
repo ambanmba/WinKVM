@@ -20,9 +20,15 @@
             <AppBarSeparator/>
             <AppBarButton x:Name="AIAgentBtn"    Icon="People"     Label="AI Agent"        Click="AIAgentBtn_Click"/>
             <AppBarSeparator/>
-            <!-- CAS Sharpness: 0=off, 100=max (default 60) -->
+            <!-- Sharpening controls -->
             <AppBarElementContainer VerticalContentAlignment="Center" Margin="4,0">
-                <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <!-- NPU toggle (Hexagon NPU via WinML) -->
+                    <ToggleSwitch x:Name="NpuToggle" Header="NPU" IsOn="False"
+                                  OffContent="" OnContent=""
+                                  MinWidth="60" VerticalAlignment="Center"
+                                  Toggled="NpuToggle_Toggled"/>
+                    <!-- GPU CAS slider (disabled when NPU is on) -->
                     <TextBlock Text="Sharp" VerticalAlignment="Center" FontSize="11"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
                     <Slider x:Name="SharpnessSlider" Width="80" Minimum="0" Maximum="100"

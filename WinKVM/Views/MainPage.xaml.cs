@@ -118,6 +118,12 @@ public sealed partial class MainPage : Page
     private void SharpnessSlider_ValueChanged(object s, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
         => KvmRenderer.Sharpness = (float)(e.NewValue / 100.0);
 
+    private void NpuToggle_Toggled(object s, RoutedEventArgs e)
+    {
+        KvmRenderer.NpuSharpenEnabled = NpuToggle.IsOn;
+        SharpnessSlider.IsEnabled = !NpuToggle.IsOn;  // mutually exclusive
+    }
+
     private void DiagnosticsBtn_Click (object s, RoutedEventArgs e) { /* TODO */ }
     private void SettingsBtn_Click    (object s, RoutedEventArgs e) { /* TODO */ }
     private void SendTextBtn_Click    (object s, RoutedEventArgs e)

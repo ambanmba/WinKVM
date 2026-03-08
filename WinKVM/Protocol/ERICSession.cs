@@ -920,12 +920,16 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     public async Task SendKeyEventAsync(ushort keyCode, bool pressed, CancellationToken ct = default)
     {
+        // Capture _conn at call time — prevents stale tasks from writing to a
+        // new connection after reconnect, which would corrupt the handshake.
+        var conn = _conn;
+        if (conn is null) return;
         var msg = new BinaryWriter2();
         msg.WriteU8((byte)ClientMessage.KeyEvent);
         msg.WriteU8(pressed ? (byte)1 : (byte)0);
         msg.WriteU16(0); // padding
         msg.WriteU32(keyCode);
-        await _conn!.WriteAsync(msg.ToArray(), ct);
+        try { await conn.WriteAsync(msg.ToArray(), ct); } catch { /* ignore if conn closed */ }
     }
 
     // Wire format: msgType(1) + buttonMask(1) + x(2) + y(2) + z(2) = 8 bytes
@@ -933,12 +937,14 @@ public sealed class ERICSession : INotifyPropertyChanged
     public async Task SendPointerEventAsync(ushort x, ushort y, byte buttonMask, short z = 0, CancellationToken ct = default)
     {
         _lastPtrX = x; _lastPtrY = y;
+        var conn = _conn;
+        if (conn is null) return;
         var msg = new BinaryWriter2();
         msg.WriteU8((byte)ClientMessage.PointerEvent);
         msg.WriteU8(buttonMask);
         msg.WriteU16(x); msg.WriteU16(y);
         msg.WriteU16((ushort)(short)z); // scroll wheel (hi_res_mouse extension)
-        await _conn!.WriteAsync(msg.ToArray(), ct);
+        try { await conn.WriteAsync(msg.ToArray(), ct); } catch { /* ignore if conn closed */ }
     }
 
     public async Task SendScrollEventAsync(ushort x, ushort y, byte buttonMask, short z, CancellationToken ct = default)

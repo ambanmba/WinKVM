@@ -26,7 +26,7 @@
             </CommandBar.SecondaryCommands>
             <CommandBar.Content>
                 <TextBlock x:Name="StatusText" VerticalAlignment="Center" Margin="8,0"
-                           Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                            FontSize="12"/>
             </CommandBar.Content>
         </CommandBar>
@@ -34,7 +34,9 @@
         <!-- Main content area -->
         <Grid Grid.Row="1">
             <!-- Login view (shown when disconnected) -->
-            <local:LoginPage x:Name="LoginPage" Visibility="Visible"/>
+            <ScrollViewer x:Name="LoginScroll" Visibility="Visible" VerticalScrollBarVisibility="Auto">
+                <local:LoginPage x:Name="LoginPage"/>
+            </ScrollViewer>
 
             <!-- Connecting/authenticating spinner -->
             <StackPanel x:Name="ConnectingPanel" Visibility="Collapsed"
@@ -79,7 +81,7 @@
         </ContentDialog>
 
         <!-- Send text flyout -->
-        <local:SendTextView x:Name="SendTextFlyout"/>
+        <local:SendTextView x:Name="SendTextFlyout" Visibility="Collapsed"/>
 
     </Grid>
 </Page>

@@ -11,17 +11,17 @@ public static class ActionExecutor
         {
             case ClickAction(var x, var y, var button):
                 byte mask = button == "right" ? (byte)4 : button == "middle" ? (byte)2 : (byte)1;
-                await session.SendPointerEventAsync((ushort)x, (ushort)y, mask, ct);
+                await session.SendPointerEventAsync((ushort)x, (ushort)y, mask, ct: ct);
                 await Task.Delay(50, ct);
-                await session.SendPointerEventAsync((ushort)x, (ushort)y, 0, ct);
+                await session.SendPointerEventAsync((ushort)x, (ushort)y, 0, ct: ct);
                 break;
 
             case DoubleClickAction(var x, var y):
                 for (int i = 0; i < 2; i++)
                 {
-                    await session.SendPointerEventAsync((ushort)x, (ushort)y, 1, ct);
+                    await session.SendPointerEventAsync((ushort)x, (ushort)y, 1, ct: ct);
                     await Task.Delay(50, ct);
-                    await session.SendPointerEventAsync((ushort)x, (ushort)y, 0, ct);
+                    await session.SendPointerEventAsync((ushort)x, (ushort)y, 0, ct: ct);
                     if (i == 0) await Task.Delay(100, ct);
                 }
                 break;
@@ -50,7 +50,7 @@ public static class ActionExecutor
                 break;
 
             case MoveMouseAction(var x, var y):
-                await session.SendPointerEventAsync((ushort)x, (ushort)y, 0, ct);
+                await session.SendPointerEventAsync((ushort)x, (ushort)y, 0, ct: ct);
                 break;
 
             case WaitAction(var seconds):

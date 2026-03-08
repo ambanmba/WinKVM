@@ -149,7 +149,7 @@ public sealed class BinaryWriter2
     public void WriteU32(uint v)   { _data.Add((byte)(v >> 24)); _data.Add((byte)(v >> 16)); _data.Add((byte)(v >> 8)); _data.Add((byte)v); }
     public void WriteI32(int v)    => WriteU32((uint)v);
     public void WriteBytes(ReadOnlySpan<byte> bytes) => _data.AddRange(bytes.ToArray());
-    public void WriteString(string s) => _data.AddRange(Encoding.UTF8.GetBytes(s));
+    public void WriteString(string s) { _data.AddRange(Encoding.UTF8.GetBytes(s)); _data.Add(0); }
 }
 
 // ── Binary reader (big-endian) ──────────────────────────────────────────────

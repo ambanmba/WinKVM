@@ -27,7 +27,7 @@
                                 Background="{ThemeResource ControlFillColorDefaultBrush}">
                             <StackPanel>
                                 <TextBlock Text="{Binding Role}" FontWeight="SemiBold" FontSize="11"
-                                           Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"/>
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
                                 <TextBlock Text="{Binding Content}" TextWrapping="Wrap" Margin="0,4,0,0"/>
                             </StackPanel>
                         </Border>
@@ -55,7 +55,7 @@
 
             <!-- Status -->
             <TextBlock x:Name="AgentStatus" Grid.Row="2" FontSize="11" TextWrapping="Wrap"
-                       Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"/>
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
         </Grid>
 
     </Grid>

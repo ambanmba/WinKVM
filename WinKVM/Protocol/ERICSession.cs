@@ -70,6 +70,7 @@ public sealed class ERICSession : INotifyPropertyChanged
     // Decoders
     private readonly HextileDecoder _hextileDecoder = new();
     private readonly ICTDecoder     _ictDecoder     = new();
+    private int _ictLogCount;
 
     // Dirty rects
     private readonly List<(int x,int y,int w,int h)> _dirtyRects = [];
@@ -77,6 +78,7 @@ public sealed class ERICSession : INotifyPropertyChanged
     // Credentials (kept only during session)
     private string? _host, _username, _password;
     private ushort  _port = 443;
+    private string? _targetPortId; // first port ID from PortList, sent in KvmSwitchEvent
 
     // Reconnect
     private string? _lastHost, _lastUsername, _lastPassword;
@@ -144,37 +146,45 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     // ── Protocol handshake ────────────────────────────────────────────────────
 
+    private static readonly string _logPath = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winkvm_proto.log");
+
     private async Task PerformConnectionAsync(CancellationToken ct)
     {
+        var stage = "connecting";
         try
         {
             _conn = new ERICConnection();
             await _conn.ConnectAsync(_host!, _port,
                 CertificateChallenge is null ? null : (fp, msg) => CertificateChallenge.Invoke(fp, msg), ct);
 
+            // e-RIC hello: client sends "e-RIC AUTH=" to identify itself (server waits for this)
+            stage = "hello";
+            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] TLS connected, sending hello\n");
+            await _conn.WriteAsync(System.Text.Encoding.ASCII.GetBytes("e-RIC AUTH="), ct);
+
+            // Version handshake: server responds with "e-RIC RFB XX.XX\n" (16 bytes)
+            stage = "version handshake";
+            var ver = await _conn.ReadAsync(16, ct);
+            var verStr = System.Text.Encoding.ASCII.GetString(ver);
+            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] Ver: '{verStr.Replace("\n","\\n")}'\n");
+            // Echo back the same version string
+            await _conn.WriteAsync(ver, ct);
+
             State = SessionState.Authenticating;
-            StatusMessage = "Authenticating...";
+            StatusMessage = $"Version: {verStr.TrimEnd()}";
 
-            // RFB version handshake
-            var ver = await _conn.ReadAsync(12, ct);
-            await _conn.WriteAsync(ver, ct); // echo back
+            _selectedAuthMethod = 0;
+            _authSuccessful = false;
 
-            // Auth
-            await PerformAuthAsync(ct);
-
-            State = SessionState.Connected;
-            StatusMessage = "Connected";
-
-            // Request framebuffer
-            await SendFramebufferUpdateRequestAsync(0, 0, 0xFFFF, 0xFFFF, incremental: false, ct);
-
-            // Message loop
+            // Single unified message loop handles auth + init + runtime (mirrors Swift)
             await MessageLoopAsync(ct);
         }
         catch (OperationCanceledException) { /* normal disconnect */ }
         catch (Exception ex)
         {
-            var msg = FriendlyError(ex);
+            var msg = $"[{stage}] {FriendlyError(ex)}";
+            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] FAILED at [{stage}]: {ex}\n");
             State = SessionState.Disconnected;
             StatusMessage = msg;
         }
@@ -184,170 +194,262 @@ public sealed class ERICSession : INotifyPropertyChanged
         }
     }
 
-    private async Task PerformAuthAsync(CancellationToken ct)
-    {
-        // Read auth caps (ServerMessage 0x20)
-        var caps = await _conn!.ReadAsync(1, ct);
-        if (caps[0] != (byte)ServerMessage.AuthCaps)
-            throw new IOException("Expected AuthCaps");
+    // Auth state for the unified message loop
+    private byte _selectedAuthMethod;
+    private bool _authSuccessful;
 
-        var numMethods = await _conn.ReadAsync(1, ct);
-        int n = numMethods[0];
-        var methods = await _conn.ReadAsync(n, ct);
-
-        // Prefer MD5
-        byte selectedMethod = methods.Contains((byte)AuthMethod.Md5) ? AuthMethod.Md5
-            : methods.Contains((byte)AuthMethod.Plain) ? AuthMethod.Plain
-            : throw new IOException("No supported auth method");
-
-        // Send Login
-        var loginMsg = new BinaryWriter2();
-        loginMsg.WriteU8((byte)ClientMessage.Login);
-        loginMsg.WriteU8(selectedMethod);
-        loginMsg.WriteString(_username!);
-        await _conn.WriteAsync(loginMsg.ToArray(), ct);
-
-        if (selectedMethod == AuthMethod.Md5)
-        {
-            // Read challenge
-            var challengeHdr = await _conn.ReadAsync(1, ct);
-            if (challengeHdr[0] != (byte)ServerMessage.SessionChallenge)
-                throw new IOException("Expected SessionChallenge");
-            var challenge = await _conn.ReadAsync(16, ct);
-            var response  = ERICAuth.Md5ChallengeResponse(challenge, _password!);
-
-            var authMsg = new BinaryWriter2();
-            authMsg.WriteU8((byte)ClientMessage.ChallengeResponse);
-            authMsg.WriteString(response);
-            await _conn.WriteAsync(authMsg.ToArray(), ct);
-        }
-        else
-        {
-            // Plain — send password
-            var plainMsg = new BinaryWriter2();
-            plainMsg.WriteU8((byte)ClientMessage.ChallengeResponse);
-            plainMsg.WriteString(_password!);
-            await _conn.WriteAsync(plainMsg.ToArray(), ct);
-        }
-
-        // Expect AuthSuccessful
-        var result = await _conn.ReadAsync(1, ct);
-        if (result[0] != (byte)ServerMessage.AuthSuccessful)
-            throw new IOException($"Authentication failed (server returned 0x{result[0]:X2})");
-
-        // Send ClientInit
-        var initMsg = new BinaryWriter2();
-        initMsg.WriteU8((byte)ClientMessage.ClientInit);
-        initMsg.WriteU8(1); // shared session
-        await _conn.WriteAsync(initMsg.ToArray(), ct);
-
-        // Read ServerInit (ServerMessage 5)
-        await ReadServerInitAsync(ct);
-
-        // Send SetPixelFormat (BGRX 32bpp LE)
-        await SendSetPixelFormatAsync(ct);
-
-        // Send SetEncodings
-        await SendSetEncodingsAsync(ct);
-    }
-
-    private async Task ReadServerInitAsync(CancellationToken ct)
-    {
-        var hdr = await _conn!.ReadAsync(1, ct);
-        if (hdr[0] != (byte)ServerMessage.ServerInit) return;
-
-        var data = await _conn.ReadAsync(24, ct); // simplified — full parse in production
-        var r    = new BinaryReader2(data);
-        int w    = r.ReadU16();
-        int h    = r.ReadU16();
-        r.Skip(16); // pixel format
-        int nameLen = (int)r.ReadU32();
-        if (nameLen > 0 && nameLen < 256)
-            await _conn.ReadAsync(nameLen, ct);
-
-        if (w > 0 && h > 0)
-        {
-            _framebuffer?.Dispose();
-            Framebuffer = new KvmFramebuffer(w, h);
-            Renderer?.EnsureTexture(w, h);
-        }
-    }
-
-    // ── Message loop ──────────────────────────────────────────────────────────
+    // ── Message loop (unified auth + init + runtime, mirrors Swift) ──────────
 
     private async Task MessageLoopAsync(CancellationToken ct)
     {
+        bool inHandshake = true; // true until first ServerFBFormat received
         while (!ct.IsCancellationRequested)
         {
             byte msgType = await _conn!.ReadByteAsync(ct);
+            System.IO.File.AppendAllText(_logPath,
+                $"[{DateTime.Now:HH:mm:ss}] Msg 0x{msgType:X2} ({(Enum.IsDefined(typeof(ServerMessage),(ServerMessage)msgType) ? ((ServerMessage)msgType).ToString() : "?")}) inHandshake={inHandshake}\n");
 
-            if (!Enum.IsDefined(typeof(ServerMessage), msgType))
+            switch (msgType)
             {
-                // Unknown message — skip 3 bytes (best-effort)
-                await _conn.ReadAsync(3, ct);
-                continue;
-            }
+                // ── Auth flow ─────────────────────────────────────────────────
+                case (byte)ServerMessage.AuthCaps: // 0x20: 1 byte bitmask
+                {
+                    var caps = (await _conn.ReadAsync(1, ct))[0];
+                    System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] AuthCaps 0x{caps:X2} (plain={(caps & AuthMethod.Plain)!=0} md5={(caps & AuthMethod.Md5)!=0})\n");
+                    _selectedAuthMethod = (caps & AuthMethod.Plain) != 0 ? AuthMethod.Plain
+                                        : (caps & AuthMethod.Md5)   != 0 ? AuthMethod.Md5
+                                        : throw new IOException($"No supported auth method (caps=0x{caps:X2})");
+                    var userBytes = Encoding.UTF8.GetBytes(_username!);
+                    var login = new BinaryWriter2();
+                    login.WriteU8((byte)ClientMessage.Login);
+                    login.WriteU8(_selectedAuthMethod);
+                    login.WriteU8((byte)(userBytes.Length + 1)); // length incl. null
+                    login.WriteU8(0);   // padding
+                    login.WriteU32(0);  // flags
+                    login.WriteBytes(userBytes);
+                    login.WriteU8(0);   // null terminator
+                    var loginArr = login.ToArray();
+                    System.IO.File.AppendAllText(_logPath,
+                        $"[{DateTime.Now:HH:mm:ss}] Login hex={BitConverter.ToString(loginArr)} userLen={userBytes.Length}\n");
+                    await _conn.WriteAsync(loginArr, ct);
+                    break;
+                }
 
-            switch ((ServerMessage)msgType)
-            {
-                case ServerMessage.FramebufferUpdate:
+                case (byte)ServerMessage.SessionChallenge: // 0x21: 1 byte len + challenge
+                {
+                    var challengeLen = (await _conn.ReadAsync(1, ct))[0];
+                    var challenge    = challengeLen > 0 ? await _conn.ReadAsync(challengeLen, ct) : [];
+                    System.IO.File.AppendAllText(_logPath,
+                        $"[{DateTime.Now:HH:mm:ss}] SessionChallenge len={challengeLen} bytes={BitConverter.ToString(challenge)}\n");
+                    string response  = _selectedAuthMethod == AuthMethod.Md5
+                        ? ERICAuth.Md5ChallengeResponse(challenge, _password!)
+                        : _password!;
+                    var respBytes = Encoding.UTF8.GetBytes(response);
+                    var resp = new BinaryWriter2();
+                    resp.WriteU8((byte)ClientMessage.ChallengeResponse);
+                    resp.WriteU8((byte)respBytes.Length);
+                    resp.WriteBytes(respBytes);
+                    System.IO.File.AppendAllText(_logPath,
+                        $"[{DateTime.Now:HH:mm:ss}] ChallengeResponse method={_selectedAuthMethod} respLen={respBytes.Length}\n");
+                    await _conn.WriteAsync(resp.ToArray(), ct);
+                    break;
+                }
+
+                case (byte)ServerMessage.AuthSuccessful: // 0x22: + 7 bytes (pad + connectionFlags)
+                    await _conn.ReadAsync(7, ct);
+                    _authSuccessful = true;
+                    System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] AuthSuccessful\n");
+                    // Stay in Authenticating state until ServerFBFormat (matching SwiftKVM)
+                    StatusMessage = "Authenticated — waiting for framebuffer...";
+                    break;
+
+                // ── Init flow ─────────────────────────────────────────────────
+                case (byte)ServerMessage.ServerInit: // 0x05: 7 bytes (3 pad + 4 serverId)
+                {
+                    var siData = await _conn.ReadAsync(7, ct);
+                    var sir = new BinaryReader2(siData);
+                    sir.Skip(3);
+                    System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] ServerInit serverId={sir.ReadU32()}\n");
+                    break;
+                }
+
+                case (byte)ServerMessage.Utf8String: // 0x07: 1 pad + 2 len + string → ClientInit
+                    await HandleUtf8StringAsync(inHandshake, ct);
+                    break;
+
+                // ── Runtime ───────────────────────────────────────────────────
+                case (byte)ServerMessage.FramebufferUpdate:
                     await HandleFramebufferUpdateAsync(ct);
                     break;
 
-                case ServerMessage.ServerFBFormat:
+                case (byte)ServerMessage.ServerFBFormat: // 0x80: pixel format descriptor
                     await HandleServerFBFormatAsync(ct);
+                    if (inHandshake)
+                    {
+                        inHandshake = false;
+                        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] Handshake done — sending init\n");
+                        await SendSetEncodingsAsync(ct);
+                        await SendSetPixelFormatAsync(ct);
+                        ushort fbW = (ushort)(_framebuffer?.Width ?? 1920);
+                        ushort fbH = (ushort)(_framebuffer?.Height ?? 1080);
+                        await SendFramebufferUpdateRequestAsync(0, 0, fbW, fbH, incremental: false, ct);
+                        State = SessionState.Connected;
+                        StatusMessage = $"Connected ({fbW}x{fbH})";
+                        _ = PingLoopAsync(ct); // keepalive: ping every 10 s
+                    }
+                    else
+                    {
+                        // Subsequent ServerFBFormat after resize: request new full frame
+                        await SendFramebufferUpdateRequestAsync(0, 0,
+                            (ushort)(_framebuffer?.Width ?? 1920), (ushort)(_framebuffer?.Height ?? 1080),
+                            incremental: false, ct);
+                    }
                     break;
 
-                case ServerMessage.PingRequest:
+                case (byte)ServerMessage.PingRequest:
                     await HandlePingAsync(ct);
                     break;
 
-                case ServerMessage.ConnectionParameterList:
+                case (byte)ServerMessage.PingReply: // 0x95: server echoes our proactive ping
+                    await _conn.ReadAsync(7, ct);   // discard: pad(3) + serial(4)
+                    break;
+
+                case (byte)ServerMessage.ConnectionParameterList:
                     await HandleConnectionParamsAsync(ct);
                     break;
 
-                case ServerMessage.ServerCommand:
+                case (byte)ServerMessage.ServerCommand:
                     await HandleServerCommandAsync(ct);
                     break;
 
-                case ServerMessage.PortList:
-                case ServerMessage.PortListExt:
+                case (byte)ServerMessage.PortList:
+                case (byte)ServerMessage.PortListExt:
                     await HandlePortListAsync(msgType == (byte)ServerMessage.PortListExt, ct);
                     break;
 
-                case ServerMessage.UsbProfileList:
+                case (byte)ServerMessage.UsbProfileList:
                     await HandleUsbProfileListAsync(ct);
                     break;
 
-                case ServerMessage.VideoSettingsS2C:
+                case (byte)ServerMessage.VideoSettingsS2C:
                     await HandleVideoSettingsAsync(ct);
                     break;
 
-                case ServerMessage.VideoQualityS2C:
+                case (byte)ServerMessage.VideoQualityS2C:
                     await HandleVideoQualityAsync(ct);
                     break;
 
-                case ServerMessage.KeyboardLayout:
+                case (byte)ServerMessage.KeyboardLayout:
                     await HandleKeyboardLayoutAsync(ct);
                     break;
 
-                case ServerMessage.MouseCapsResponse:
+                case (byte)ServerMessage.MouseCapsResponse:
                     await HandleMouseCapsAsync(ct);
                     break;
 
-                case ServerMessage.VirtualMediaConfig:
+                case (byte)ServerMessage.VirtualMediaConfig:
                     await HandleVirtualMediaConfigAsync(ct);
                     break;
 
-                case ServerMessage.AckPixelFormat:
-                    // no payload
+                case (byte)ServerMessage.VmMountsResponse: // 0xA6: option(1)+index(1)+pad(1)+retCode(4)
+                    await _conn.ReadAsync(7, ct);
+                    break;
+
+                case (byte)ServerMessage.VmShareTable: // 0xA7: entryCount(1)+per entry: hostLen(1)+imageLen(1)+host+image
+                {
+                    int vmCount = (await _conn.ReadAsync(1, ct))[0];
+                    for (int vi = 0; vi < vmCount; vi++)
+                    {
+                        var lens = await _conn.ReadAsync(2, ct);
+                        if (lens[0] > 0) await _conn.ReadAsync(lens[0], ct);
+                        if (lens[1] > 0) await _conn.ReadAsync(lens[1], ct);
+                    }
+                    break;
+                }
+
+                case (byte)ServerMessage.UserNotification: // 0x03: flags(1) + pad(2) + errorCode(4)
+                {
+                    var unData = await _conn.ReadAsync(7, ct);
+                    var unr = new BinaryReader2(unData);
+                    var unFlags = unr.ReadU8(); unr.Skip(2);
+                    var unCode  = unr.ReadU32();
+                    System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] UserNotification flags=0x{unFlags:X2} code={unCode}\n");
+                    break;
+                }
+
+                case (byte)ServerMessage.OsdState: // 0x10: blanking(1) + timeout(2) + msgLen(2) + msg
+                {
+                    var osdHdr = await _conn.ReadAsync(5, ct);
+                    var osdr = new BinaryReader2(osdHdr);
+                    osdr.Skip(3); // blanking + timeout
+                    int osdMsgLen = osdr.ReadU16();
+                    if (osdMsgLen > 0 && osdMsgLen <= 4096)
+                        await _conn.ReadAsync(osdMsgLen, ct);
+                    break;
+                }
+
+                case (byte)ServerMessage.AckPixelFormat: // 0x13: 19 bytes (pad3+pixelFormat16)
+                    await _conn.ReadAsync(19, ct);
+                    break;
+
+                case (byte)ServerMessage.ServerRCMessage: // 0x83: pad(3)+size(4)+data
+                {
+                    var rcHdr = await _conn.ReadAsync(7, ct);
+                    var rcr = new BinaryReader2(rcHdr); rcr.Skip(3);
+                    int rcSize = (int)rcr.ReadU32();
+                    if (rcSize > 0 && rcSize <= 1 << 20) await _conn.ReadAsync(rcSize, ct);
+                    break;
+                }
+
+                case (byte)ServerMessage.BandwidthRequest: // 0x96: stage(1)+len(2)+data
+                {
+                    var bwHdr = await _conn.ReadAsync(3, ct);
+                    int bwLen = (bwHdr[1] << 8) | bwHdr[2];
+                    if (bwLen > 0 && bwLen <= 65536) await _conn.ReadAsync(bwLen, ct);
+                    break;
+                }
+
+                case (byte)ServerMessage.TerminalConfig: // 0xAD: 3 bytes
+                    await _conn.ReadAsync(3, ct);
+                    break;
+
+                case (byte)ServerMessage.TerminalInputSettings: // 0xAE: 4 bytes
+                    await _conn.ReadAsync(4, ct);
                     break;
 
                 default:
-                    // Drain unknown message (4-byte payload guess)
-                    await _conn.ReadAsync(4, ct);
-                    break;
+                    System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] Unknown msg 0x{msgType:X2} — disconnecting\n");
+                    throw new IOException($"Unknown server message 0x{msgType:X2}");
+
             }
+        }
+    }
+
+    private async Task HandleUtf8StringAsync(bool inHandshake, CancellationToken ct)
+    {
+        await _conn!.ReadAsync(1, ct); // 1 padding byte
+        var lenBytes = await _conn.ReadAsync(2, ct);
+        int len = (lenBytes[0] << 8) | lenBytes[1];
+        if (len > 0) await _conn.ReadAsync(len, ct);
+
+        if (inHandshake)
+        {
+            // ClientInit: [type, 0, initflags(2)] — bit 3 = extended port ID
+            var initMsg = new BinaryWriter2();
+            initMsg.WriteU8((byte)ClientMessage.ClientInit);
+            initMsg.WriteU8(0);
+            initMsg.WriteU16(0x0008);
+            await _conn.WriteAsync(initMsg.ToArray(), ct);
+
+            // KvmSwitchEvent: [type, pad, portIdLen(2 BE), portId bytes]
+            var kvmMsg = new BinaryWriter2();
+            kvmMsg.WriteU8((byte)ClientMessage.KvmSwitchEvent);
+            kvmMsg.WriteU8(0);
+            var portIdBytes = _targetPortId is not null ? Encoding.UTF8.GetBytes(_targetPortId) : [];
+            kvmMsg.WriteU16((ushort)portIdBytes.Length);
+            if (portIdBytes.Length > 0) kvmMsg.WriteBytes(portIdBytes);
+            await _conn.WriteAsync(kvmMsg.ToArray(), ct);
+            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] Sent ClientInit + KvmSwitchEvent portId='{_targetPortId ?? ""}'\n");
         }
     }
 
@@ -357,38 +459,142 @@ public sealed class ERICSession : INotifyPropertyChanged
     {
         var hdrBytes = await _conn!.ReadAsync(7, ct);
         var r = new BinaryReader2(hdrBytes);
-        byte  flags    = r.ReadU8();
+        byte   flags    = r.ReadU8();
         ushort numRects = r.ReadU16();
         uint   size     = r.ReadU32();
 
         _dirtyRects.Clear();
+
+        bool useChunkReader = (flags & 0x08) != 0;
+        if ((flags & 0x01) != 0) await _conn.ReadAsync(8, ct); // timestamp
+
+        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] FBUpdate flags=0x{flags:X2} numRects={numRects} size={size}\n");
+
+        // Pipeline: request next frame BEFORE decoding so the server prepares it
+        // while we are decoding. Matches SwiftKVM's pipelineRequest pattern.
+        await SendFramebufferUpdateRequestAsync(0, 0, (ushort)(_framebuffer?.Width ?? 1920),
+            (ushort)(_framebuffer?.Height ?? 1080), incremental: true, ct);
+
+        if (useChunkReader)
+            await HandleChunkWiseFBUpdateAsync(numRects, (int)size, ct);
+        else
+            await HandleNormalFBUpdateAsync(numRects, ct);
+
+        // FPS tracking
+        _fpsCount++;
+        var now = DateTime.Now;
+        var elapsed = (now - _fpsLast).TotalSeconds;
+        if (elapsed >= 1.0)
+        {
+            CurrentFps = _fpsCount / elapsed;
+            AvgFps     = (AvgFps * 0.9) + (CurrentFps * 0.1);
+            _fpsCount  = 0;
+            _fpsLast   = now;
+        }
+    }
+
+    // ── Chunk-wise FBUpdate (flags & 0x08) ───────────────────────────────────
+    // Rect headers are 12 bytes (no dataSize field); all chunk data is read
+    // at once into a flat buffer, then parsed with a cursor (SwiftKVM pattern).
+    private async Task HandleChunkWiseFBUpdateAsync(int numRects, int sizeHint, CancellationToken ct)
+    {
+        var reader  = new ChunkReader(_conn!);
+        var allData = await reader.ReadAllAsync(sizeHint, ct);
+        int cursor  = 0;
+
+        for (int ri = 0; ri < numRects && cursor + 12 <= allData.Length; ri++)
+        {
+            var rh  = new BinaryReader2(allData.AsSpan(cursor, 12));
+            ushort rx = rh.ReadU16(), ry = rh.ReadU16(), rw = rh.ReadU16(), rh2 = rh.ReadU16();
+            int enc = rh.ReadI32();
+            cursor += 12;
+
+            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}]   rect[{ri}] ({rx},{ry}) {rw}x{rh2} enc=0x{enc:X} [chunk]\n");
+
+            if ((RfbEncoding)enc == RfbEncoding.NewFBSize)
+            {
+                if (rw > 0 && rh2 > 0)
+                {
+                    _framebuffer?.Dispose();
+                    Framebuffer = new KvmFramebuffer(rw, rh2);
+                    Renderer?.EnsureTexture(rw, rh2);
+                }
+                continue;
+            }
+            if ((RfbEncoding)enc == RfbEncoding.LastRect) break;
+            if (rw == 0 || rh2 == 0 || cursor >= allData.Length) continue;
+
+            int encType = enc & 0xFF;
+            if (encType is 129 or 131 or 132 or 133)
+            {
+                // ICT: remaining buffer is the compressed frame
+                int subenc = (enc >> 12) & 0xF;
+                var slice  = allData[cursor..];
+                var planes = _ictDecoder.Decode(slice, rw, rh2, subenc);
+                if (planes is not null && Renderer is { } ren)
+                    ren.UploadYCbCr(planes);
+                cursor = allData.Length; // ICT consumes the rest
+            }
+            else if ((RfbEncoding)enc == RfbEncoding.Raw && _framebuffer is not null)
+            {
+                int sz = rw * rh2 * 4;
+                if (cursor + sz <= allData.Length)
+                    RawDecoder.Decode(allData[cursor..(cursor + sz)], _framebuffer, rx, ry, rw, rh2);
+                cursor += sz;
+                _dirtyRects.Add((rx, ry, rw, rh2));
+                Renderer?.UploadFramebuffer(_framebuffer, _dirtyRects.Count > 0 ? _dirtyRects : null);
+            }
+            else if ((RfbEncoding)enc == RfbEncoding.Hextile && _framebuffer is not null)
+            {
+                var slice = allData[cursor..];
+                var (hFills, hRawTiles, _) = _hextileDecoder.Decode(slice, _framebuffer, rx, ry, rw, rh2);
+                Renderer?.ExecuteFills([.. hFills], _framebuffer.Width, _framebuffer.Height);
+                cursor = allData.Length;
+            }
+            else
+            {
+                System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}]   unknown enc 0x{enc:X} [chunk]\n");
+                cursor = allData.Length;
+            }
+        }
+    }
+
+    // ── Normal FBUpdate (flags & 0x08 == 0) ──────────────────────────────────
+    // Rect headers are 16 bytes (includes 4-byte dataSize).
+    private async Task HandleNormalFBUpdateAsync(int numRects, CancellationToken ct)
+    {
         var fills    = new List<FillCommand>();
         var rawTiles = new List<RawTileCommand>();
-        var rawData  = new byte[0];
         var rawDataMs = new MemoryStream();
-
-        bool useChunkReader = (flags & 0x02) != 0;
-        var chunk = useChunkReader ? new ChunkReader(_conn) : null;
 
         for (int ri = 0; ri < numRects; ri++)
         {
-            byte[] rectHdrBytes = chunk is not null
-                ? await chunk.ReadAsync(16, ct)
-                : await _conn.ReadAsync(16, ct);
-
+            var rectHdrBytes = await _conn!.ReadAsync(16, ct);
             var rh   = new BinaryReader2(rectHdrBytes);
             ushort rx = rh.ReadU16(), ry = rh.ReadU16(), rw = rh.ReadU16(), rh2 = rh.ReadU16();
             int enc  = rh.ReadI32();
             uint ds  = rh.ReadU32();
 
-            if (rw == 0 || rh2 == 0) continue;
+            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}]   rect[{ri}] ({rx},{ry}) {rw}x{rh2} enc=0x{enc:X} ds={ds}\n");
 
-            byte[] rectData = chunk is not null
-                ? await chunk.ReadAsync((int)ds, ct)
-                : await _conn.ReadAsync((int)ds, ct);
+            if ((RfbEncoding)enc == RfbEncoding.NewFBSize)
+            {
+                if (rw > 0 && rh2 > 0)
+                {
+                    _framebuffer?.Dispose();
+                    Framebuffer = new KvmFramebuffer(rw, rh2);
+                    Renderer?.EnsureTexture(rw, rh2);
+                    System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}]   NewFBSize → {rw}x{rh2}\n");
+                }
+                continue;
+            }
+            if ((RfbEncoding)enc == RfbEncoding.LastRect) break;
+            if (rw == 0 || rh2 == 0 || ds == 0) continue;
 
+            var rectData = await _conn.ReadAsync((int)ds, ct);
             if (_framebuffer is null) continue;
 
+            int encType = enc & 0xFF;
             switch ((RfbEncoding)enc)
             {
                 case RfbEncoding.Raw:
@@ -404,99 +610,101 @@ public sealed class ERICSession : INotifyPropertyChanged
                     rawTiles.AddRange(hRawTiles.Select(t => t with { DataOffset = t.DataOffset + offset }));
                     break;
 
-                case RfbEncoding.NewFBSize:
-                    if (rw > 0 && rh2 > 0)
-                    {
-                        _framebuffer?.Dispose();
-                        Framebuffer = new KvmFramebuffer(rw, rh2);
-                        Renderer?.EnsureTexture(rw, rh2);
-                    }
-                    break;
-
                 default:
-                    // ICT and other encodings handled by serverFBFormat path
+                    if (encType is 129 or 131 or 132 or 133)
+                    {
+                        int subenc = (enc >> 12) & 0xF;
+                        var planes = _ictDecoder.Decode(rectData, rw, rh2, subenc);
+                        if (planes is not null && Renderer is { } ren)
+                            ren.UploadYCbCr(planes);
+                    }
+                    else
+                        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}]   unknown enc 0x{enc:X} ds={ds}\n");
                     break;
             }
         }
 
-        if (chunk is not null) await chunk.FinishAsync(ct);
-
-        // Flush to GPU
         if (Renderer is { } r2 && _framebuffer is { } fb)
         {
             if (fills.Count > 0)
                 r2.ExecuteFills([.. fills], fb.Width, fb.Height);
-            else
-                r2.UploadFramebuffer(fb, _dirtyRects.Count > 0 ? _dirtyRects : null);
+            else if (_dirtyRects.Count > 0)
+                r2.UploadFramebuffer(fb, _dirtyRects);
         }
-
-        // FPS tracking
-        _fpsCount++;
-        var now = DateTime.Now;
-        var elapsed = (now - _fpsLast).TotalSeconds;
-        if (elapsed >= 1.0)
-        {
-            CurrentFps = _fpsCount / elapsed;
-            AvgFps     = (AvgFps * 0.9) + (CurrentFps * 0.1);
-            _fpsCount  = 0;
-            _fpsLast   = now;
-        }
-
-        // Request next frame
-        await SendFramebufferUpdateRequestAsync(0, 0, (ushort)(_framebuffer?.Width ?? 1920),
-            (ushort)(_framebuffer?.Height ?? 1080), incremental: true, ct);
     }
 
     private async Task HandleServerFBFormatAsync(CancellationToken ct)
     {
-        // ICT frame: read header, decode, upload YCbCr to GPU
-        var hdr = await _conn!.ReadAsync(12, ct);
+        // isUnsupported(1) + width(2) + height(2) + pixelFormat(16) = 21 bytes
+        var hdr = await _conn!.ReadAsync(21, ct);
         var r   = new BinaryReader2(hdr);
+        r.Skip(1); // isUnsupported
         ushort w = r.ReadU16(), h = r.ReadU16();
-        int quality = r.ReadU8();
-        r.Skip(3);
-        uint dataSize = r.ReadU32();
+        // skip 16 bytes of pixel format (bpp+depth+bigEndian+trueColour+redMax+greenMax+blueMax+shifts+pad)
 
-        var data = await _conn.ReadAsync((int)dataSize, ct);
+        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] ServerFBFormat {w}x{h}\n");
 
-        if (w > 0 && h > 0)
+        if (w > 0 && h > 0 && (_framebuffer is null || _framebuffer.Width != w || _framebuffer.Height != h))
         {
-            var planes = await Task.Run(() => _ictDecoder.Decode(data, w, h, quality), ct);
-            if (planes is not null && Renderer is { } renderer)
-            {
-                renderer.UploadYCbCr(planes);
-                planes.Dispose();
-            }
+            _framebuffer?.Dispose();
+            Framebuffer = new KvmFramebuffer(w, h);
+            Renderer?.EnsureTexture(w, h);
         }
-
-        await SendFramebufferUpdateRequestAsync(0, 0, w, h, incremental: true, ct);
     }
 
     // ── Ping ──────────────────────────────────────────────────────────────────
 
+    private uint _pingSerial;
+
+    /// Respond to a server PingRequest (0x94).
+    /// Wire format (after msgType): pad(1) + pad(2) + serial(4) = 7 bytes total.
     private async Task HandlePingAsync(CancellationToken ct)
     {
-        var ping = await _conn!.ReadAsync(4, ct);
+        var data = await _conn!.ReadAsync(7, ct); // 3 pad + 4 serial
         var reply = new BinaryWriter2();
         reply.WriteU8((byte)ClientMessage.PingReply);
-        reply.WriteBytes(ping);
+        reply.WriteBytes(data); // echo all 7 bytes back
         await _conn.WriteAsync(reply.ToArray(), ct);
+    }
+
+    /// Proactive keepalive: send PingRequest every 10 s (matching SwiftKVM ERICPing).
+    private async Task PingLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(10), ct);
+                _pingSerial++;
+                var msg = new BinaryWriter2();
+                msg.WriteU8((byte)ClientMessage.PingRequest);
+                msg.WriteU8(0); // pad
+                msg.WriteU32(_pingSerial);
+                msg.WriteU16(0); // pad
+                await _conn!.WriteAsync(msg.ToArray(), ct);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch { /* connection gone */ }
     }
 
     // ── ConnectionParameterList ───────────────────────────────────────────────
 
     private async Task HandleConnectionParamsAsync(CancellationToken ct)
     {
-        var lenBytes = await _conn!.ReadAsync(2, ct);
-        ushort len   = (ushort)((lenBytes[0] << 8) | lenBytes[1]);
-        if (len == 0) return;
-        var data = await _conn.ReadAsync(len, ct);
-        var text = Encoding.UTF8.GetString(data);
-        foreach (var pair in text.Split(';'))
+        var count = (await _conn!.ReadAsync(1, ct))[0];
+        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] ConnectionParameterList count={count}\n");
+        for (int i = 0; i < count; i++)
         {
-            var eq = pair.IndexOf('=');
-            if (eq > 0)
-                ConnectionParams[pair[..eq].Trim()] = pair[(eq+1)..].Trim();
+            var lens     = await _conn.ReadAsync(2, ct);
+            int nameLen  = lens[0];
+            int valueLen = lens[1];
+            var nameBytes = nameLen  > 0 ? await _conn.ReadAsync(nameLen,  ct) : [];
+            var valBytes  = valueLen > 0 ? await _conn.ReadAsync(valueLen, ct) : [];
+            var name  = Encoding.UTF8.GetString(nameBytes);
+            var value = Encoding.UTF8.GetString(valBytes);
+            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}]   param[{i}] {name}={value}\n");
+            ConnectionParams[name] = value;
         }
         if (ConnectionParams.TryGetValue("audio_support", out var au))
             AudioSupport = au;
@@ -506,24 +714,47 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     private async Task HandleServerCommandAsync(CancellationToken ct)
     {
-        var lenBytes = await _conn!.ReadAsync(2, ct);
-        ushort len   = (ushort)((lenBytes[0] << 8) | lenBytes[1]);
-        if (len > 0) await _conn.ReadAsync(len, ct); // consume — parsed as needed
+        // pad(1) + commandLen(2 BE) + paramsLen(2 BE) + command + params
+        var hdr = await _conn!.ReadAsync(5, ct);
+        int cmdLen    = (hdr[1] << 8) | hdr[2];
+        int paramsLen = (hdr[3] << 8) | hdr[4];
+        if (cmdLen > 4096 || paramsLen > 65536)
+            throw new IOException($"ServerCommand too large: cmd={cmdLen} params={paramsLen}");
+        var cmd    = cmdLen    > 0 ? Encoding.UTF8.GetString(await _conn.ReadAsync(cmdLen,    ct)) : "";
+        var param  = paramsLen > 0 ? Encoding.UTF8.GetString(await _conn.ReadAsync(paramsLen, ct)) : "";
+        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] ServerCommand '{cmd}' params='{param}'\n");
     }
 
     // ── Port list ─────────────────────────────────────────────────────────────
 
     private async Task HandlePortListAsync(bool ext, CancellationToken ct)
     {
-        var cnt = await _conn!.ReadAsync(1, ct);
+        // pad(1) + numPorts(2 BE) — same format for PortList and PortListExt
+        var hdr = await _conn!.ReadAsync(3, ct);
+        int numPorts = (hdr[1] << 8) | hdr[2];
+        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] PortList numPorts={numPorts}\n");
         Ports.Clear();
-        for (int i = 0; i < cnt[0]; i++)
+        _targetPortId = null;
+        for (int i = 0; i < numPorts; i++)
         {
-            var idBytes = await _conn.ReadAsync(ext ? 4 : 2, ct);
-            var nameLen = (await _conn.ReadAsync(1, ct))[0];
-            var name    = nameLen > 0 ? Encoding.UTF8.GetString(await _conn.ReadAsync(nameLen, ct)) : "";
-            string id   = ext ? BitConverter.ToString(idBytes) : $"{idBytes[0]:X2}{idBytes[1]:X2}";
-            Ports.Add(new KvmPort(id, (ushort)(i + 1), name));
+            // kvmPerm(1)+vmPerm(1)+powerPerm(1)+pad(1)+portNoLen(2)+portIdLen(2)+portNameLen(2)+cimTypeLen(2)=12
+            var ph = await _conn.ReadAsync(12, ct);
+            var pr = new BinaryReader2(ph);
+            pr.Skip(4); // kvmPerm + vmPerm + powerPerm + pad
+            int portNoLen   = pr.ReadU16();
+            int portIdLen   = pr.ReadU16();
+            int portNameLen = pr.ReadU16();
+            int cimTypeLen  = pr.ReadU16();
+            var portNo   = portNoLen   > 0 ? Encoding.UTF8.GetString(await _conn.ReadAsync(portNoLen,   ct)) : "";
+            var portId   = portIdLen   > 0 ? Encoding.UTF8.GetString(await _conn.ReadAsync(portIdLen,   ct)) : "";
+            var portName = portNameLen > 0 ? Encoding.UTF8.GetString(await _conn.ReadAsync(portNameLen, ct)) : "";
+            if (cimTypeLen > 0) await _conn.ReadAsync(cimTypeLen, ct);
+            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}]   Port[{i}] no='{portNo}' id='{portId}' name='{portName}'\n");
+            if (!string.IsNullOrEmpty(portId))
+            {
+                Ports.Add(new KvmPort(portId, (ushort)(i + 1), portName));
+                _targetPortId ??= portId;
+            }
         }
     }
 
@@ -531,27 +762,41 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     private async Task HandleUsbProfileListAsync(CancellationToken ct)
     {
-        var cnt = (await _conn!.ReadAsync(1, ct))[0];
+        // entryCount(2 BE) + per entry: nameLen(1)+descLen(2 BE)+flags(1)+profileId(2 BE)+name+desc
+        var cntBytes = await _conn!.ReadAsync(2, ct);
+        int cnt = (cntBytes[0] << 8) | cntBytes[1];
         UsbProfiles.Clear();
-        for (int i = 0; i < cnt; i++)
+        ActiveUsbProfileId = null;
+        for (int i = 0; i < cnt && cnt <= 256; i++)
         {
-            var idBytes = await _conn.ReadAsync(2, ct);
-            ushort id   = (ushort)((idBytes[0] << 8) | idBytes[1]);
-            var nLen    = (await _conn.ReadAsync(1, ct))[0];
-            var name    = nLen > 0 ? Encoding.UTF8.GetString(await _conn.ReadAsync(nLen, ct)) : "";
+            var eh      = await _conn.ReadAsync(6, ct);
+            int nameLen = eh[0];
+            int descLen = (eh[1] << 8) | eh[2];
+            byte flags  = eh[3];
+            ushort id   = (ushort)((eh[4] << 8) | eh[5]);
+            var name    = nameLen > 0 ? Encoding.UTF8.GetString(await _conn.ReadAsync(nameLen, ct)) : "";
+            if (descLen > 0) await _conn.ReadAsync(descLen, ct);
             UsbProfiles.Add(new UsbProfile(id, name));
+            if ((flags & 1) != 0) ActiveUsbProfileId = id;
         }
+        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] UsbProfileList: {cnt} profiles\n");
     }
 
     // ── Video / keyboard / mouse ──────────────────────────────────────────────
 
     private async Task HandleVideoSettingsAsync(CancellationToken ct)
     {
-        var data = await _conn!.ReadAsync(6, ct);
-        var r    = new BinaryReader2(data);
-        ushort w = r.ReadU16(), h = r.ReadU16();
-        r.Skip(2);
-        VideoSettings = new VideoSettings("Unknown", w, h);
+        // pad(1)+brightnessRGB(3)+contrastRGB(3)+autoColorCal(1)+autoAdjust(1)
+        // +clock(2)+phase(2)+offsetX(2)+offsetY(2)+resX(2)+resY(2)+refreshRate(2)+noiseFilter(2)+offsetYMax(2)
+        // = 27 bytes total
+        var data = await _conn!.ReadAsync(27, ct);
+        var r = new BinaryReader2(data);
+        r.Skip(9); // pad + brightness + contrast + autoCC + autoAdj
+        r.Skip(4); // clock + phase
+        r.Skip(4); // offsetX + offsetY
+        ushort resX = r.ReadU16(), resY = r.ReadU16();
+        VideoSettings = new VideoSettings("Unknown", resX, resY);
+        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] VideoSettings {resX}x{resY}\n");
     }
 
     private async Task HandleVideoQualityAsync(CancellationToken ct)
@@ -562,9 +807,15 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     private async Task HandleKeyboardLayoutAsync(CancellationToken ct)
     {
-        var len  = (await _conn!.ReadAsync(1, ct))[0];
-        var data = len > 0 ? await _conn.ReadAsync(len, ct) : [];
-        KeyboardLayout = Encoding.ASCII.GetString(data);
+        // pad(1) + len(2 BE) + string
+        await _conn!.ReadAsync(1, ct); // pad
+        var lenBytes = await _conn.ReadAsync(2, ct);
+        int len = (lenBytes[0] << 8) | lenBytes[1];
+        if (len > 0 && len <= 1024)
+        {
+            var data = await _conn.ReadAsync(len, ct);
+            KeyboardLayout = Encoding.UTF8.GetString(data);
+        }
     }
 
     private async Task HandleMouseCapsAsync(CancellationToken ct)
@@ -575,8 +826,10 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     private async Task HandleVirtualMediaConfigAsync(CancellationToken ct)
     {
-        var d = await _conn!.ReadAsync(4, ct);
-        VmDriveCount = d[0];
+        var numDrives = (await _conn!.ReadAsync(1, ct))[0];
+        if (numDrives > 0) await _conn.ReadAsync(numDrives, ct); // driveTypes
+        VmDriveCount = numDrives;
+        System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] VirtualMediaConfig: {numDrives} drives\n");
     }
 
     // ── Client → Server messages ──────────────────────────────────────────────
@@ -608,13 +861,15 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     private async Task SendSetEncodingsAsync(CancellationToken ct)
     {
+        // 255 = auto-hardware (let server pick best HW encoding)
+        // 0xB083 = ICT4K YCbCr420 JPEG Q75 (encoding 131 | subencoding 11<<12)
+        const int Ict4k420Jpeg75 = 131 | (11 << 12); // 0xB083
         var encodings = new[]
         {
-            (int)RfbEncoding.Hextile,
-            (int)RfbEncoding.Raw,
+            255,                        // auto-hardware
+            Ict4k420Jpeg75,             // ICT 4K YCbCr420 JPEG Q75
             (int)RfbEncoding.NewFBSize,
             (int)RfbEncoding.LastRect,
-            128, // ICT (Raritan proprietary)
         };
         var msg = new BinaryWriter2();
         msg.WriteU8((byte)ClientMessage.SetEncodings);
@@ -634,23 +889,21 @@ public sealed class ERICSession : INotifyPropertyChanged
         await _conn!.WriteAsync(msg.ToArray(), ct);
     }
 
-    public async Task SendPointerEventAsync(ushort x, ushort y, byte buttonMask, CancellationToken ct = default)
+    // Wire format: msgType(1) + buttonMask(1) + x(2) + y(2) + z(2) = 8 bytes
+    // The z field is 0 for moves/clicks; non-zero for scroll wheel.
+    public async Task SendPointerEventAsync(ushort x, ushort y, byte buttonMask, short z = 0, CancellationToken ct = default)
     {
         var msg = new BinaryWriter2();
         msg.WriteU8((byte)ClientMessage.PointerEvent);
         msg.WriteU8(buttonMask);
         msg.WriteU16(x); msg.WriteU16(y);
+        msg.WriteU16((ushort)(short)z); // scroll wheel (hi_res_mouse extension)
         await _conn!.WriteAsync(msg.ToArray(), ct);
     }
 
     public async Task SendScrollEventAsync(ushort x, ushort y, byte buttonMask, short z, CancellationToken ct = default)
     {
-        // RFB scroll: button mask bits 3 (up) and 4 (down)
-        byte scrollMask = buttonMask;
-        if (z > 0) for (int i = 0; i < z; i++) scrollMask |= 8;
-        if (z < 0) for (int i = 0; i < -z; i++) scrollMask |= 16;
-        await SendPointerEventAsync(x, y, scrollMask, ct);
-        await SendPointerEventAsync(x, y, 0, ct);
+        await SendPointerEventAsync(x, y, buttonMask, z, ct);
     }
 
     public void SendCtrlAltDel()

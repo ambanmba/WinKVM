@@ -8,7 +8,8 @@ public sealed partial class MainWindow : Window
     {
         this.InitializeComponent();
         this.Title = "WinKVM";
-        this.ExtendsContentIntoTitleBar = true;
-        this.AppWindow.SetIcon("Assets/AppIcon.ico");
+        var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
+        if (File.Exists(iconPath))
+            this.AppWindow.SetIcon(iconPath);
     }
 }

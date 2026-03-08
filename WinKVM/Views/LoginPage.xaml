@@ -20,7 +20,7 @@
             <FontIcon Glyph="&#xE7F4;" FontSize="48"/>
             <TextBlock Text="WinKVM" Style="{StaticResource TitleTextBlockStyle}" HorizontalAlignment="Center"/>
             <TextBlock Text="Raritan KX III/IV Client" Style="{StaticResource CaptionTextBlockStyle}"
-                       HorizontalAlignment="Center" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"/>
+                       HorizontalAlignment="Center" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
         </StackPanel>
 
         <!-- Saved profiles -->

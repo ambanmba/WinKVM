@@ -1,15 +1,18 @@
 using System.Text.Json;
-using Windows.Storage;
 
 namespace WinKVM.Models;
 
-/// Persists connection profiles to ApplicationData LocalSettings (JSON).
+/// Persists connection profiles to %LOCALAPPDATA%\WinKVM\ (JSON files).
+/// Uses plain file I/O so the app can run unpackaged (no MSIX identity needed).
 public sealed class ProfileStore
 {
-    private const string ProfilesKey   = "ConnectionProfiles";
-    private const string PasswordPrefix = "kvm_pw_";
+    private static readonly string DataDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinKVM");
+    private static readonly string ProfilesFile = Path.Combine(DataDir, "profiles.json");
+    private static readonly string PasswordsFile = Path.Combine(DataDir, "passwords.json");
 
     private List<ConnectionProfile> _profiles = new();
+    private Dictionary<string, string> _passwords = new();
 
     public IReadOnlyList<ConnectionProfile> Profiles => _profiles;
 
@@ -21,18 +24,29 @@ public sealed class ProfileStore
 
     private void Load()
     {
-        var settings = ApplicationData.Current.LocalSettings;
-        if (settings.Values[ProfilesKey] is string json)
+        Directory.CreateDirectory(DataDir);
+        if (File.Exists(ProfilesFile))
         {
-            try { _profiles = JsonSerializer.Deserialize<List<ConnectionProfile>>(json) ?? new(); }
+            try { _profiles = JsonSerializer.Deserialize<List<ConnectionProfile>>(File.ReadAllText(ProfilesFile)) ?? new(); }
             catch { _profiles = new(); }
+        }
+        if (File.Exists(PasswordsFile))
+        {
+            try { _passwords = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(PasswordsFile)) ?? new(); }
+            catch { _passwords = new(); }
         }
     }
 
     private void Save()
     {
-        var json = JsonSerializer.Serialize(_profiles);
-        ApplicationData.Current.LocalSettings.Values[ProfilesKey] = json;
+        Directory.CreateDirectory(DataDir);
+        File.WriteAllText(ProfilesFile, JsonSerializer.Serialize(_profiles));
+    }
+
+    private void SavePasswords()
+    {
+        Directory.CreateDirectory(DataDir);
+        File.WriteAllText(PasswordsFile, JsonSerializer.Serialize(_passwords));
     }
 
     // ── CRUD ────────────────────────────────────────────────────────────────
@@ -58,23 +72,20 @@ public sealed class ProfileStore
         Changed?.Invoke();
     }
 
-    // ── Password storage via Windows Credential Manager ─────────────────────
+    // ── Password storage ─────────────────────────────────────────────────────
 
     public void SavePassword(Guid id, string password)
     {
-        var key = PasswordPrefix + id.ToString("N");
-        ApplicationData.Current.LocalSettings.Values[key] = password;
+        _passwords[id.ToString("N")] = password;
+        SavePasswords();
     }
 
-    public string? LoadPassword(Guid id)
-    {
-        var key = PasswordPrefix + id.ToString("N");
-        return ApplicationData.Current.LocalSettings.Values[key] as string;
-    }
+    public string? LoadPassword(Guid id) =>
+        _passwords.TryGetValue(id.ToString("N"), out var pw) ? pw : null;
 
     private void DeletePassword(Guid id)
     {
-        var key = PasswordPrefix + id.ToString("N");
-        ApplicationData.Current.LocalSettings.Values.Remove(key);
+        _passwords.Remove(id.ToString("N"));
+        SavePasswords();
     }
 }

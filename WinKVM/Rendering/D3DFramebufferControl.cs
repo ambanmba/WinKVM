@@ -20,8 +20,11 @@ namespace WinKVM.Rendering;
 /// NPU path (ICT decode):
 ///   ICTDequant.hlsl compute shader runs IDCT in parallel on NPU/GPU when the
 ///   DirectML dispatch is issued from ERICSession after dequantization on CPU.
-public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
+public sealed class D3DFramebufferControl : Grid, IDisposable
 {
+    // Native SwapChainPanel — a pure WinRT object (not a managed subclass) so that
+    // Marshal.QueryInterface for ISwapChainPanelNative succeeds on its native peer.
+    private readonly SwapChainPanel _panel = new();
     // ── D3D11 objects ────────────────────────────────────────────────────────
     private ID3D11Device?             _device;
     private ID3D11DeviceContext?      _ctx;
@@ -35,6 +38,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
     private ID3D11ComputeShader?      _fillCS;
     private ID3D11ComputeShader?      _ictCS;
     private ID3D11SamplerState?       _linearSampler;
+    private ID3D11RasterizerState?    _noCullRS; // no-cull for fullscreen triangle passes
 
     // Display texture (BGRA8, persistent)
     private ID3D11Texture2D?          _displayTex;
@@ -62,24 +66,35 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
     public D3DFramebufferControl()
     {
+        Children.Add(_panel);
         Loaded   += (_, _) => Initialize();
         Unloaded += (_, _) => Dispose();
     }
 
+    private static readonly string _d3dLog = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winkvm_d3d.log");
+
     private void Initialize()
     {
-        var featureLevels = new[] { FeatureLevel.Level_11_0 };
-        D3D11.D3D11CreateDevice(
-            null,
-            DriverType.Hardware,
-            DeviceCreationFlags.BgraSupport,
-            featureLevels,
-            out _device,
-            out _ctx);
-
-        CreateSwapChain();
-        CompileShaders();
-        CreateSamplers();
+        try
+        {
+            var featureLevels = new[] { FeatureLevel.Level_11_0 };
+            D3D11.D3D11CreateDevice(
+                null, DriverType.Hardware, DeviceCreationFlags.BgraSupport, featureLevels,
+                out _device, out _ctx);
+            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] D3D11 device ok\n");
+            CreateSwapChain();
+            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] SwapChain ok\n");
+            CompileShaders();
+            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] Shaders ok\n");
+            CreateSamplers();
+            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] Init complete\n");
+        }
+        catch (Exception ex)
+        {
+            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] Init FAILED: {ex}\n");
+            throw;
+        }
     }
 
     private void CreateSwapChain()
@@ -104,9 +119,17 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
         _swapChain = dxgiFactory.CreateSwapChainForComposition(_device!, desc);
 
-        // Connect swap chain to this SwapChainPanel via ISwapChainPanelNative COM interop
-        var nativePanel = (ISwapChainPanelNative)(object)this;
-        nativePanel.SetSwapChain(_swapChain);
+        // Connect swap chain to _panel (a pure WinRT SwapChainPanel, not a managed subclass) via
+        // ISwapChainPanelNative COM interop. QI on the managed subclass fails; _panel works.
+        IntPtr nativePeerPtr = ((WinRT.IWinRTObject)_panel).NativeObject.ThisPtr;
+        var iid = typeof(ISwapChainPanelNative).GUID;
+        Marshal.ThrowExceptionForHR(Marshal.QueryInterface(nativePeerPtr, ref iid, out IntPtr panelNativePtr));
+        try
+        {
+            var nativePanel = (ISwapChainPanelNative)Marshal.GetObjectForIUnknown(panelNativePtr);
+            nativePanel.SetSwapChain(_swapChain.NativePointer);
+        }
+        finally { Marshal.Release(panelNativePtr); }
 
         CreateRTV();
 
@@ -150,13 +173,12 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
         var ycbcrPSBytes   = CompileHlsl("YCbCr.hlsl",      "ps_5_0", "PS");
         var displayPSBytes = CompileHlsl("Display.hlsl",    "ps_5_0", "PS");
         var fillCSBytes    = CompileHlsl("HextileFill.hlsl","cs_5_0", "CS");
-        var ictCSBytes     = CompileHlsl("ICTDequant.hlsl", "cs_5_0", "CS");
+        // ICTDequant.hlsl (GPU IDCT) not compiled — ICT decode is fully CPU-side.
 
         _fullscreenVS = _device.CreateVertexShader(vsBytes);
         _ycbcrPS      = _device.CreatePixelShader(ycbcrPSBytes);
         _displayPS    = _device.CreatePixelShader(displayPSBytes);
         _fillCS       = _device.CreateComputeShader(fillCSBytes);
-        _ictCS        = _device.CreateComputeShader(ictCSBytes);
     }
 
     private void CreateSamplers()
@@ -169,6 +191,13 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
             AddressW = TextureAddressMode.Clamp,
         };
         _linearSampler = _device!.CreateSamplerState(desc);
+
+        // No-cull rasterizer for fullscreen triangle (CCW in D3D11 NDC)
+        _noCullRS = _device.CreateRasterizerState(new RasterizerDescription
+        {
+            FillMode = FillMode.Solid,
+            CullMode = CullMode.None,
+        });
     }
 
     // ── Texture management ───────────────────────────────────────────────────
@@ -266,7 +295,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
     /// Upload YCbCr planes and render via GPU YCbCr→RGB shader.
     public unsafe void UploadYCbCr(YCbCrPlanes planes)
     {
-        if (_device is null || _ctx is null) return;
+        if (_device is null || _ctx is null || _ycbcrPS is null || _displayPS is null) return;
         FbWidth  = planes.Width;
         FbHeight = planes.Height;
         EnsureDisplayTexture(planes.Width, planes.Height);
@@ -278,6 +307,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
         // GPU render: YCbCr→BGRA into displayTexture
         _ctx.OMSetRenderTargets(_displayRTV!);
+        _ctx.RSSetState(_noCullRS!);
         _ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         _ctx.VSSetShader(_fullscreenVS!);
         _ctx.PSSetShader(_ycbcrPS!);
@@ -360,8 +390,12 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
         var sc = _swapChain!.Description1;
         var vp = new Viewport(0, 0, (float)sc.Width, (float)sc.Height);
 
+        // Unbind display texture from any lingering RTV before using it as SRV
+        _ctx.OMSetRenderTargets((ID3D11RenderTargetView?)null);
+
         _ctx.OMSetRenderTargets(_rtv);
         _ctx.RSSetViewport(vp);
+        _ctx.RSSetState(_noCullRS!);
         _ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         _ctx.VSSetShader(_fullscreenVS!);
         _ctx.PSSetShader(_displayPS!);
@@ -369,7 +403,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
         _ctx.PSSetSamplers(0, [_linearSampler!]);
         _ctx.Draw(3, 0);
 
-        _swapChain.Present(1, PresentFlags.None); // VSync
+        _swapChain.Present(0, PresentFlags.None);
     }
 
     /// Capture the current display texture as a PNG byte array.
@@ -408,10 +442,12 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
 
     // ── ISwapChainPanelNative COM interop ────────────────────────────────────
 
-    [ComImport, Guid("F92F19D2-3ADE-45A6-A20C-F6F1EA90554B"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    // WinUI 3 (Windows App SDK) ISwapChainPanelNative GUID — different from UWP's F92F19D2.
+    // Defined in microsoft.ui.xaml.media.dxinterop.h.
+    [ComImport, Guid("63aad0b8-7c24-40ff-85a8-640d944cc325"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface ISwapChainPanelNative
     {
-        void SetSwapChain([MarshalAs(UnmanagedType.Interface)] IDXGISwapChain swapChain);
+        [PreserveSig] int SetSwapChain(IntPtr swapChain);
     }
 
     // ── Dispose ──────────────────────────────────────────────────────────────
@@ -422,7 +458,7 @@ public sealed class D3DFramebufferControl : SwapChainPanel, IDisposable
         _fillCmdSRV?.Dispose(); _fillCmdBuf?.Dispose();
         _displayUAV?.Dispose(); _displayRTV?.Dispose();
         _displaySRV?.Dispose(); _displayTex?.Dispose();
-        _linearSampler?.Dispose();
+        _noCullRS?.Dispose(); _linearSampler?.Dispose();
         _ictCS?.Dispose(); _fillCS?.Dispose();
         _ycbcrPS?.Dispose(); _displayPS?.Dispose(); _fullscreenVS?.Dispose();
         _rtv?.Dispose(); _swapChain?.Dispose();

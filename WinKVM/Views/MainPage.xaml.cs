@@ -41,12 +41,17 @@ public sealed partial class MainPage : Page
     {
         DispatcherQueue.TryEnqueue(() =>
         {
-            LoginPage.Visibility      = state == SessionState.Disconnected ? Visibility.Visible  : Visibility.Collapsed;
+            LoginScroll.Visibility     = state == SessionState.Disconnected ? Visibility.Visible  : Visibility.Collapsed;
             ConnectingPanel.Visibility = (state == SessionState.Connecting || state == SessionState.Authenticating)
                                         ? Visibility.Visible : Visibility.Collapsed;
-            ConnectedPanel.Visibility = state == SessionState.Connected ? Visibility.Visible : Visibility.Collapsed;
+            ConnectedPanel.Visibility  = state == SessionState.Connected ? Visibility.Visible : Visibility.Collapsed;
 
-            StatusText.Text = _session.StatusMessage;
+            var msg = _session.StatusMessage;
+            StatusText.Text       = msg;
+            if (state == SessionState.Disconnected && msg.StartsWith("Connection error"))
+                StatusText.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.OrangeRed);
+            else
+                StatusText.ClearValue(TextBlock.ForegroundProperty);
 
             DisconnectBtn.IsEnabled  = state == SessionState.Connected;
             CtrlAltDelBtn.IsEnabled  = state == SessionState.Connected;
@@ -82,7 +87,8 @@ public sealed partial class MainPage : Page
         var tcs = new TaskCompletionSource<bool>();
         DispatcherQueue.TryEnqueue(async () =>
         {
-            CertDialogText.Text = message;
+            CertDialogText.Text  = message;
+            CertDialog.XamlRoot  = XamlRoot;
             var result = await CertDialog.ShowAsync();
             tcs.SetResult(result == ContentDialogResult.Primary);
         });

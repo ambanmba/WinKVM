@@ -37,6 +37,6 @@ float4 PS(VSOut i) : SV_Target
     float g = saturate(y - 0.344  * cbS - 0.714 * crS);
     float b = saturate(y + 1.772  * cbS);
 
-    // Output BGRA (Direct3D BGRA8 format)
-    return float4(b, g, r, 1.0);
+    // Output RGBA — D3D11 maps float4(r,g,b,a) to (R,G,B,A) channels regardless of BGRA memory layout
+    return float4(r, g, b, 1.0);
 }

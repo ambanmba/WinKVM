@@ -1,21 +1,21 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace WinKVM.Framebuffer;
 
 /// Decodes ICT (Integrated Color Transform) encoding — Raritan's custom JPEG-like codec.
-/// 16×16 tiles, Huffman-coded DCT coefficients, YCbCr 4:2:0 colour space.
+/// Direct port of SwiftKVM's ICTDecoder.swift (decompiled from Raritan Java client).
 ///
-/// GPU acceleration strategy:
-///   • CPU: Huffman decode + dequantization (inherently serial per tile)
-///   • GPU: Inverse DCT via HLSL compute shader (ICTDequant.hlsl) — batched across tiles
-///   • GPU: YCbCr→RGB via HLSL pixel shader (YCbCr.hlsl) — full-frame render pass
-///
-/// On this decode path the CPU produces dequantized DCT coefficient blocks which
-/// are uploaded as a structured buffer to the GPU for parallel IDCT execution,
-/// then the GPU renders YCbCr planes directly to the display texture.
-public sealed class ICTDecoder
+/// Key differences from standard JPEG:
+///   • Custom Huffman tables (not JPEG Annex K)
+///   • Custom quantization (quantFactors[subenc] × normalization coefficients)
+///   • HIVE tile-skip bitstream (3-level VLC for inter-frame compression)
+///   • Per-tile DC reset (not carried across tiles)
+///   • Per-tile byte-count + padding alignment after each tile
+///   • Integer IDCT (Int16/Int32 arithmetic, no floating point)
+public sealed class ICTDecoder : IDisposable
 {
-    // ── Quantization tables (standard JPEG baseline, matching Raritan hardware) ──
+    // ── Quantization tables (same as JPEG baseline) ──────────────────────────
 
     private static readonly int[] QuantLumi = [
         16, 11, 10, 16, 24, 40, 51, 61,
@@ -50,401 +50,572 @@ public sealed class ICTDecoder
         53, 60, 61, 54, 47, 55, 62, 63
     ];
 
-    // Precomputed scaled quantization factors (factor / quality * scale)
-    private float[] _qLumi   = new float[64];
-    private float[] _qChroma = new float[64];
-    private int     _lastQuality = -1;
+    // ── QuantFactors table — indexed by subencoding (ccr) ────────────────────
+    // Decompiled from Raritan Java client. subenc=11 → factor=0.5, shift=0.
+    private readonly record struct QuantFactor(double Factor, int Shift);
+    private static readonly QuantFactor[] QuantFactors = [
+        new(0.7,   3), new(0.5,   3), new(0.7,   2), new(0.5,   2),
+        new(0.2,   3), new(0.7,   1), new(0.15,  3), new(0.5,   1),
+        new(0.2,   2), new(0.7,   0), new(0.15,  2), new(0.5,   0),
+        new(0.2,   1), new(0.15,  1), new(0.2,   0), new(0.15,  0),
+    ];
 
-    // Scratch buffers reused across frames
-    private float[] _coeffs = new float[64];
-    private float[] _idct   = new float[64];
+    // ── DCT normalization coefficients (baked into quant tables) ─────────────
+    private static readonly double[] KCoeff = [
+        0.35355333390593, 0.047565149415, 0.158113883008, 0.047565149415,
+        0.35355333390593, 0.047565149415, 0.158113883008, 0.047565149415
+    ];
 
-    // ── Huffman tables (DC and AC, lumi and chroma) ─────────────────────────
-    // Populated on first use from standard JPEG Annex K tables.
-    private HuffTable? _dcLumi, _dcChroma, _acLumi, _acChroma;
+    // ── JPEG magnitude decode helpers ─────────────────────────────────────────
+    private static readonly int[] Cats = [0, 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047];
+    private static readonly int[] Sign = [0, 1, 2, 4,  8, 16, 32,  64, 128, 256,  512, 1024];
 
-    // ── Output buffers ───────────────────────────────────────────────────────
-    // Reused to avoid per-frame allocation. Sized for maximum 2560×1440.
-    private byte[]? _yBuf, _cbBuf, _crBuf;
-    private int     _yStride, _cStride;
-
-    public void ReleaseBuffers() { _yBuf = _cbBuf = _crBuf = null; }
-
-    // ── Public decode API ────────────────────────────────────────────────────
-
-    /// Decode an ICT frame into YCbCr planes suitable for GPU upload.
-    /// Returns null on parse error (malformed stream or unsupported variant).
-    public YCbCrPlanes? Decode(ReadOnlySpan<byte> data, int frameWidth, int frameHeight, int quality)
+    // ── Huffman table entry (flat 65536-entry lookup by 16-bit prefix) ────────
+    // BitCount = -1 means uninitialized (sentinel). Valid range is 0..15 (16-bit codes → 0).
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct HuffEntry
     {
-        EnsureQuantTables(quality);
-        EnsureHuffTables();
-        EnsureOutputBuffers(frameWidth, frameHeight);
-
-        var bits = new BitReader(data);
-
-        int tilesX = (frameWidth  + 15) / 16;
-        int tilesY = (frameHeight + 15) / 16;
-
-        // CPU: Huffman decode + dequantization per tile (serial — data dependent)
-        // The resulting spatial-domain blocks are written directly into _yBuf/_cbBuf/_crBuf.
-        // The GPU then converts YCbCr→RGB in a single render pass.
-        int dcY = 0, dcCb = 0, dcCr = 0;
-
-        for (int tileY = 0; tileY < tilesY; tileY++)
-        for (int tileX = 0; tileX < tilesX; tileX++)
-        {
-            // Read HIVE skip count
-            int skip = bits.ReadHiveSkip();
-
-            // Luma (4 8×8 blocks per 16×16 tile)
-            for (int b = 0; b < 4; b++)
-            {
-                if (!DecodeBlock(ref bits, _dcLumi!, _acLumi!, _qLumi, ref dcY, _coeffs, _idct)) return null;
-                int bx = (b & 1) * 8, by = (b >> 1) * 8;
-                WriteLumaBlock(tileX * 16 + bx, tileY * 16 + by, frameWidth, frameHeight);
-            }
-
-            // Cb
-            if (!DecodeBlock(ref bits, _dcChroma!, _acChroma!, _qChroma, ref dcCb, _coeffs, _idct)) return null;
-            WriteChromaBlock(_cbBuf!, tileX, tileY, (frameWidth + 1) / 2, (frameHeight + 1) / 2);
-
-            // Cr
-            if (!DecodeBlock(ref bits, _dcChroma!, _acChroma!, _qChroma, ref dcCr, _coeffs, _idct)) return null;
-            WriteChromaBlock(_crBuf!, tileX, tileY, (frameWidth + 1) / 2, (frameHeight + 1) / 2);
-
-            _ = skip; // skip is used by the bitstream reader internally
-        }
-
-        var planes = new YCbCrPlanes(frameWidth, frameHeight);
-        unsafe
-        {
-            fixed (byte* y = _yBuf, cb = _cbBuf, cr = _crBuf)
-            {
-                Buffer.MemoryCopy(y,  planes.Y,  planes.YSize, planes.YSize);
-                Buffer.MemoryCopy(cb, planes.Cb, planes.CSize, planes.CSize);
-                Buffer.MemoryCopy(cr, planes.Cr, planes.CSize, planes.CSize);
-            }
-        }
-        return planes;
+        public sbyte Cat;       // magnitude category (or 12 = end-of-package for DC)
+        public sbyte Rl;        // run-length (AC only)
+        public sbyte BitCount;  // bits remaining after code (16 - code_length); -1 = unset
     }
 
-    // ── Internals ────────────────────────────────────────────────────────────
+    private readonly record struct HuffCode(int Size, int Code);
 
-    private void EnsureQuantTables(int quality)
+    // ── Quantization / Huffman instance state ─────────────────────────────────
+    private readonly HuffEntry[] _huffDcL;
+    private readonly HuffEntry[] _huffDcC;
+    private readonly HuffEntry[] _huffAcL;
+    private readonly HuffEntry[] _huffAcC;
+    private int _currentCcr = -1;
+    private readonly int[] _yqTable  = new int[64];
+    private readonly int[] _cqTable  = new int[64];
+
+    // ── Per-tile coefficient scratch buffer (6 blocks × 64 = 384 Int16) ──────
+    private readonly short[] _blockBuf = new short[6 * 64];
+
+    // ── Persistent inter-frame planes (skipped tiles keep previous frame) ─────
+    private YCbCrPlanes? _planes;
+
+    // ── Bit-reader state ──────────────────────────────────────────────────────
+    private ulong  _bitBuf;
+    private int    _bitCount;
+    private byte[] _streamBuf = [];
+    private int    _streamLen;
+    private int    _streamOff;
+
+    // ── Constructor ───────────────────────────────────────────────────────────
+
+    public ICTDecoder()
     {
-        if (quality == _lastQuality) return;
-        _lastQuality = quality;
-        float scale = quality < 50
-            ? 5000f / quality
-            : 200f - 2f * quality;
-        for (int i = 0; i < 64; i++)
+        _huffDcL = BuildHuffTable(LumDcCodes);
+        _huffDcC = BuildHuffTable(ChromaDcCodes);
+        _huffAcL = BuildHuffTable(LumAcCodes);
+        _huffAcC = BuildHuffTable(ChromaAcCodes);
+    }
+
+    public void Dispose()
+    {
+        _planes?.Dispose();
+        _planes = null;
+    }
+
+    public void ReleaseBuffers()
+    {
+        _planes?.Dispose();
+        _planes = null;
+    }
+
+    // ── Huffman table construction ────────────────────────────────────────────
+
+    private static HuffEntry[] BuildHuffTable(HuffCode[] codes)
+    {
+        // Initialize all entries as unset (BitCount = -1 is the sentinel).
+        var tab = new HuffEntry[65536];
+        for (int i = 0; i < tab.Length; i++) tab[i].BitCount = -1;
+
+        for (int i = 0; i < codes.Length; i++)
         {
-            _qLumi[i]   = Math.Clamp(QuantLumi[i]   * scale / 100f, 1, 255);
-            _qChroma[i] = Math.Clamp(QuantChroma[i] * scale / 100f, 1, 255);
-        }
-    }
-
-    private void EnsureHuffTables()
-    {
-        if (_dcLumi is not null) return;
-        _dcLumi   = HuffTable.BuildDcLumi();
-        _dcChroma = HuffTable.BuildDcChroma();
-        _acLumi   = HuffTable.BuildAcLumi();
-        _acChroma = HuffTable.BuildAcChroma();
-    }
-
-    private void EnsureOutputBuffers(int w, int h)
-    {
-        int ySize = w * h;
-        int cSize = ((w + 1) / 2) * ((h + 1) / 2);
-        if (_yBuf is null || _yBuf.Length < ySize)  _yBuf  = new byte[ySize];
-        if (_cbBuf is null || _cbBuf.Length < cSize) _cbBuf = new byte[cSize];
-        if (_crBuf is null || _crBuf.Length < cSize) _crBuf = new byte[cSize];
-        _yStride = w;
-        _cStride = (w + 1) / 2;
-    }
-
-    private bool DecodeBlock(ref BitReader bits, HuffTable dcTable, HuffTable acTable,
-                              float[] qTable, ref int dcPred,
-                              float[] coeffs, float[] idct)
-    {
-        Array.Clear(coeffs);
-
-        // DC coefficient
-        int dcSize = bits.DecodeHuff(dcTable);
-        if (dcSize < 0) return false;
-        int dcVal  = dcSize > 0 ? bits.ReadSignedBits(dcSize) : 0;
-        dcPred    += dcVal;
-        coeffs[0]  = dcPred * qTable[0];
-
-        // AC coefficients
-        int k = 1;
-        while (k < 64)
-        {
-            int sym = bits.DecodeHuff(acTable);
-            if (sym < 0) return false;
-            if (sym == 0x00) break; // EOB
-            if (sym == 0xF0) { k += 16; continue; } // ZRL
-            int run  = sym >> 4;
-            int size = sym & 0xF;
-            k += run;
-            if (k >= 64) return false;
-            int ac = bits.ReadSignedBits(size);
-            coeffs[Zigzag[k]] = ac * qTable[k];
-            k++;
+            int size = codes[i].Size;
+            if (size == 0) continue;
+            int idx = (codes[i].Code << (16 - size)) & 0xFFFF;
+            tab[idx].Cat      = (sbyte)(i & 0xF);
+            tab[idx].Rl       = (sbyte)((i >> 4) & 0xF);
+            tab[idx].BitCount = (sbyte)(16 - size); // 0 for 16-bit codes — valid, not sentinel
         }
 
-        InverseICT(coeffs, idct);
-        return true;
+        // Fill unoccupied entries by propagating the last explicitly-set entry.
+        // Uses BitCount == -1 as sentinel, since valid codes have BitCount 0..15.
+        sbyte lastCat = 0, lastRl = 0, lastBc = 0;
+        for (int i = 0; i < 65536; i++)
+        {
+            ref var e = ref tab[i];
+            if (e.BitCount != -1) { lastCat = e.Cat; lastRl = e.Rl; lastBc = e.BitCount; }
+            else                  { e.Cat = lastCat; e.Rl = lastRl; e.BitCount = lastBc;  }
+        }
+        return tab;
     }
 
-    /// 2D separable IDCT (AAN algorithm) — runs on CPU.
-    /// The GPU variant (ICTDequant.hlsl) handles dequantized coefficient blocks
-    /// in parallel when more than ~4 tiles need decoding simultaneously.
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void InverseICT(float[] coeff, float[] result)
+    // ── Quantization table setup ──────────────────────────────────────────────
+
+    private void SetupQuantTables(int ccr)
     {
-        const float W1 = 0.98078528f, W2 = 0.92387953f, W3 = 0.83146961f;
-        const float W4 = 0.70710678f, W5 = 0.55557023f, W6 = 0.38268343f, W7 = 0.19509032f;
-
-        var tmp = new float[64];
-
-        // Row pass
-        for (int row = 0; row < 8; row++)
+        const int scaler = 16; // scalerShift(6) + 10
+        var mul = QuantFactors[ccr];
+        for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
         {
-            int i = row * 8;
-            float s0 = coeff[i], s1 = coeff[i+1], s2 = coeff[i+2], s3 = coeff[i+3];
-            float s4 = coeff[i+4], s5 = coeff[i+5], s6 = coeff[i+6], s7 = coeff[i+7];
-
-            float t0 = (s0 + s4) * W4;
-            float t1 = (s0 - s4) * W4;
-            float t2 = s2 * W6 - s6 * W2;
-            float t3 = s2 * W2 + s6 * W6;
-
-            float p0 = t0 + t3, p1 = t1 + t2, p2 = t1 - t2, p3 = t0 - t3;
-
-            float q0 = s1*W7 - s7*W1, q1 = s3*W3 - s5*W5;
-            float q2 = s1*W1 + s7*W7, q3 = s3*W5 + s5*W3;
-            float r0 = q0 + q1, r1 = q2 + q3, r2 = q2 - q3, r3 = q0 - q1;
-            float u0 = (r0 - r1) * W4, u1 = (r2 + r3) * W4;
-
-            tmp[i+0] = p0 + r1;
-            tmp[i+1] = p1 + u1 + r3;
-            tmp[i+2] = p2 + u0;
-            tmp[i+3] = p3 - u1 + r0 - r1;
-            tmp[i+4] = p3 + u1 - r0 + r1;
-            tmp[i+5] = p2 - u0;
-            tmp[i+6] = p1 - u1 - r3;
-            tmp[i+7] = p0 - r1;
-        }
-
-        // Column pass
-        for (int col = 0; col < 8; col++)
-        {
-            float s0 = tmp[col], s1 = tmp[col+8], s2 = tmp[col+16], s3 = tmp[col+24];
-            float s4 = tmp[col+32], s5 = tmp[col+40], s6 = tmp[col+48], s7 = tmp[col+56];
-
-            float t0 = (s0 + s4) * W4;
-            float t1 = (s0 - s4) * W4;
-            float t2 = s2 * W6 - s6 * W2;
-            float t3 = s2 * W2 + s6 * W6;
-
-            float p0 = t0 + t3, p1 = t1 + t2, p2 = t1 - t2, p3 = t0 - t3;
-
-            float q0 = s1*W7 - s7*W1, q1 = s3*W3 - s5*W5;
-            float q2 = s1*W1 + s7*W7, q3 = s3*W5 + s5*W3;
-            float r0 = q0 + q1, r1 = q2 + q3, r2 = q2 - q3, r3 = q0 - q1;
-            float u0 = (r0 - r1) * W4, u1 = (r2 + r3) * W4;
-
-            result[col+0*8] = p0 + r1;
-            result[col+1*8] = p1 + u1 + r3;
-            result[col+2*8] = p2 + u0;
-            result[col+3*8] = p3 - u1 + r0 - r1;
-            result[col+4*8] = p3 + u1 - r0 + r1;
-            result[col+5*8] = p2 - u0;
-            result[col+6*8] = p1 - u1 - r3;
-            result[col+7*8] = p0 - r1;
+            int pos = i * 8 + j;
+            double n = KCoeff[i] * KCoeff[j];
+            _yqTable[pos] = QuantTableValue(QuantLumi[pos],   mul.Factor, mul.Shift, scaler, n);
+            _cqTable[pos] = QuantTableValue(QuantChroma[pos], mul.Factor, mul.Shift, scaler, n);
         }
     }
 
-    private void WriteLumaBlock(int x, int y, int fw, int fh)
+    private static int QuantTableValue(int b, double factor, int fShift, int scaler, double norm)
     {
-        for (int row = 0; row < 8 && y + row < fh; row++)
-        {
-            int dstOff = (y + row) * _yStride + x;
-            for (int col = 0; col < 8 && x + col < fw; col++)
-                _yBuf![dstOff + col] = Clamp8(_idct[row * 8 + col] + 128f);
-        }
+        int entry = (int)(8192.0 / (b * factor) + 0.5);
+        if (entry == 8192) entry--;
+        entry >>= fShift;
+        return (int)(8192.0 / entry * (1 << scaler) * norm + 0.5);
     }
 
-    private void WriteChromaBlock(byte[] plane, int tileX, int tileY, int cw, int ch)
+    // ── Bit reader ────────────────────────────────────────────────────────────
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureBits(int n)
     {
-        for (int row = 0; row < 8 && tileY * 8 + row < ch; row++)
+        while (_bitCount < n)
         {
-            int dstOff = (tileY * 8 + row) * _cStride + tileX * 8;
-            for (int col = 0; col < 8 && tileX * 8 + col < cw; col++)
-                plane[dstOff + col] = Clamp8(_idct[row * 8 + col] + 128f);
+            ulong b = _streamOff < _streamLen ? _streamBuf[_streamOff] : 0u;
+            _streamOff++;
+            _bitBuf |= b << (56 - _bitCount);
+            _bitCount += 8;
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static byte Clamp8(float v) => (byte)Math.Clamp((int)(v + 0.5f), 0, 255);
-}
+    private int PeekBits(int n) => (int)(_bitBuf >> (64 - n));
 
-// ── Minimal Huffman decoder ─────────────────────────────────────────────────
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void DropBits(int n) { _bitBuf <<= n; _bitCount -= n; }
 
-internal sealed class HuffTable
-{
-    // Standard JPEG Annex K tables (abbreviated)
-    // Full tables omitted for brevity — populated from JPEG spec constants.
-    private readonly Dictionary<(int len, int code), int> _map = new();
-    private int _maxLen;
-
-    private HuffTable() { }
-
-    public int Lookup(int code, int len, out bool found)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int GetBits(int n)
     {
-        found = _map.TryGetValue((len, code), out int sym);
-        return sym;
+        int v = (int)(_bitBuf >> (64 - n));
+        _bitBuf <<= n; _bitCount -= n;
+        return v;
     }
 
-    public int MaxLen => _maxLen;
+    // ── HIVE tile-skip VLC ────────────────────────────────────────────────────
+    // Format:
+    //   0            → skip = 0 (decode this tile)
+    //   1 0 <6-bit>  → skip = <6-bit value>  (0..63)
+    //   1 1 <16-bit> → skip = <16-bit value>; 65535 = end-of-update sentinel (-1)
 
-    private static HuffTable Build(byte[] lengths, byte[] values)
+    private int ReadHiveSkip()
     {
-        var t   = new HuffTable();
-        int val = 0, code = 0;
-        for (int li = 0; li < lengths.Length; li++)
+        EnsureBits(1);
+        if (GetBits(1) == 0) return 0;
+        EnsureBits(1);
+        if (GetBits(1) == 0) { EnsureBits(6); return GetBits(6); }
+        EnsureBits(16);
+        int v = GetBits(16);
+        return v == 65535 ? -1 : v;
+    }
+
+    // After each decoded tile: read the byte-count field (ignored, used by
+    // hardware for random-access seeking) then pad to byte boundary.
+
+    private void ReadHiveTileByteCount()
+    {
+        EnsureBits(1);
+        if (GetBits(1) == 0) { EnsureBits(7);  GetBits(7);  }
+        else                 { EnsureBits(10); GetBits(10); }
+    }
+
+    private void ReadHiveTilePadding()
+    {
+        int pad = _bitCount % 8;
+        if (pad > 0) DropBits(pad);
+    }
+
+    // ── JPEG magnitude decoder ────────────────────────────────────────────────
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int GetRealValue(int cat)
+    {
+        if (cat == 0) return 0;
+        EnsureBits(cat);
+        int bits = GetBits(cat);
+        return (bits & Sign[cat]) != 0 ? bits : -(Cats[cat] - bits);
+    }
+
+    // ── Huffman block decode → coefficients in blockBuf[off..off+64] ─────────
+
+    private int DecodeBlock(int off, int lastDc, int[] qTable, HuffEntry[] dcTab, HuffEntry[] acTab)
+    {
+        // DC coefficient
+        EnsureBits(16);
+        int dcIdx = PeekBits(16);
+        int cat = dcTab[dcIdx].Cat;
+        DropBits(16 - dcTab[dcIdx].BitCount);
+        if (cat == 12) return lastDc; // end-of-package sentinel
+
+        int dc = lastDc + GetRealValue(cat);
+        _blockBuf[off] = (short)((int)((long)dc * qTable[0]) >> 10);
+
+        // AC coefficients
+        int count = 0;
+        while (count < 64)
         {
-            int count = lengths[li];
-            for (int ci = 0; ci < count; ci++)
-                t._map[(li + 1, code++)] = values[val++];
-            code <<= 1;
+            EnsureBits(16);
+            int acIdx = PeekBits(16);
+            int acCat = acTab[acIdx].Cat;
+            int rl    = acTab[acIdx].Rl;
+            DropBits(16 - acTab[acIdx].BitCount);
+            if (rl == 0 && acCat == 0) break; // EOB
+
+            int value = GetRealValue(acCat);
+            count += rl + 1;
+            if (count < 64)
+            {
+                int t = Zigzag[count];
+                _blockBuf[t + off] = (short)((int)((long)qTable[t] * value) >> 10);
+            }
         }
-        t._maxLen = lengths.Length;
-        return t;
+        return dc;
     }
 
-    // Standard JPEG DC luma table (Annex K)
-    public static HuffTable BuildDcLumi() => Build(
-        [0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0],
-        [0,1,2,3,4,5,6,7,8,9,10,11]);
+    // ── Integer Inverse ICT (port of SwiftKVM's inverseICT) ──────────────────
+    // Reads 8×8 Int16 block from blockBuf[tileOff..], writes bytes to dest.
+    // Final output: saturate((value >> 6) + 128) → UInt8.
 
-    // Standard JPEG DC chroma table
-    public static HuffTable BuildDcChroma() => Build(
-        [0,3,1,1,1,1,1,1,1,1,1,0,0,0,0,0],
-        [0,1,2,3,4,5,6,7,8,9,10,11]);
+    private unsafe void InverseICT(int tileOff, byte* dest, int destOff, int linesize)
+    {
+        // Row pass
+        for (int row = 0; row < 8; row++)
+        {
+            int off = tileOff + 8 * row;
+            int x0 = _blockBuf[off], x1 = _blockBuf[off+1], x2 = _blockBuf[off+2], x3 = _blockBuf[off+3];
+            int x4 = _blockBuf[off+4], x5 = _blockBuf[off+5], x6 = _blockBuf[off+6], x7 = _blockBuf[off+7];
 
-    // Standard JPEG AC luma table (first 162 entries)
-    public static HuffTable BuildAcLumi() => Build(
-        [0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,125],
-        AcLumiValues);
+            if ((x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0)
+            {
+                short s = _blockBuf[off];
+                _blockBuf[off+1]=_blockBuf[off+2]=_blockBuf[off+3]=_blockBuf[off+4]=
+                _blockBuf[off+5]=_blockBuf[off+6]=_blockBuf[off+7]=s;
+                continue;
+            }
 
-    // Standard JPEG AC chroma table
-    public static HuffTable BuildAcChroma() => Build(
-        [0,2,1,2,4,4,3,4,7,5,4,4,0,1,2,119],
-        AcChromaValues);
+            int a0 = x0+x6, a1 = x0-x6, a2 = x2+x4, a3 = x2-x4;
+            int x2_2 = x2<<1, x6_2 = x6<<1;
+            int b0 = a0+a2+x2_2, b2 = a1-x6_2+a3, b4 = a0+x6_2-a2, b6 = a1-(a3+x2_2);
 
-    private static readonly byte[] AcLumiValues = [
-        0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,0x51,0x61,
-        0x07,0x22,0x71,0x14,0x32,0x81,0x91,0xA1,0x08,0x23,0x42,0xB1,0xC1,0x15,0x52,
-        0xD1,0xF0,0x24,0x33,0x62,0x72,0x82,0x09,0x0A,0x16,0x17,0x18,0x19,0x1A,0x25,
-        0x26,0x27,0x28,0x29,0x2A,0x34,0x35,0x36,0x37,0x38,0x39,0x3A,0x43,0x44,0x45,
-        0x46,0x47,0x48,0x49,0x4A,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5A,0x63,0x64,
-        0x65,0x66,0x67,0x68,0x69,0x6A,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7A,0x83,
-        0x84,0x85,0x86,0x87,0x88,0x89,0x8A,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,
-        0x9A,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,0xA8,0xA9,0xAA,0xB2,0xB3,0xB4,0xB5,0xB6,
-        0xB7,0xB8,0xB9,0xBA,0xC2,0xC3,0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,0xD2,0xD3,
-        0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,
-        0xE9,0xEA,0xF1,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,0xF9,0xFA
+            int d0 = x1+x7, d1 = x1-x7, d2 = x5+x3, d3 = x5-x3;
+            int e0 = d0-d3, e1 = d0-d2, e2 = d3-d1, e3 = d2+d1;
+            int f0 = -8*x1+x3, f1 = x1+8*x5, f2 = x7+8*x3, f3 = x5+8*x7;
+            int bo0 = 2*e0+8*d2-f0, bo1 = 2*e1+8*d1-f1, bo2 = 2*e2+8*d0-f2, bo3 = 2*e3+8*d3-f3;
+
+            _blockBuf[off+0] = (short)(b0+bo0); _blockBuf[off+7] = (short)(b0-bo0);
+            _blockBuf[off+1] = (short)(b2+bo1); _blockBuf[off+6] = (short)(b2-bo1);
+            _blockBuf[off+2] = (short)(b4+bo2); _blockBuf[off+5] = (short)(b4-bo2);
+            _blockBuf[off+3] = (short)(b6+bo3); _blockBuf[off+4] = (short)(b6-bo3);
+        }
+
+        // Column pass + saturating output
+        for (int col = 0; col < 8; col++)
+        {
+            int off = tileOff + col;
+            int x0 = _blockBuf[off],    x1 = _blockBuf[off+8],  x2 = _blockBuf[off+16], x3 = _blockBuf[off+24];
+            int x4 = _blockBuf[off+32], x5 = _blockBuf[off+40], x6 = _blockBuf[off+48], x7 = _blockBuf[off+56];
+
+            if ((x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0)
+            {
+                byte val = Sat(x0);
+                int d = destOff + col;
+                for (int r = 0; r < 8; r++) { dest[d] = val; d += linesize; }
+                continue;
+            }
+
+            int a0 = x0+x6, a1 = x0-x6, a2 = x2+x4, a3 = x2-x4;
+            int x2_2 = x2<<1, x6_2 = x6<<1;
+            int b0 = a0+a2+x2_2, b2 = a1-x6_2+a3, b4 = a0+x6_2-a2, b6 = a1-(a3+x2_2);
+
+            int d0 = x1+x7, d1 = x1-x7, d2 = x5+x3, d3 = x5-x3;
+            int e0 = d0-d3, e1 = d0-d2, e2 = d3-d1, e3 = d2+d1;
+            int f0 = -8*x1+x3, f1 = x1+8*x5, f2 = x7+8*x3, f3 = x5+8*x7;
+            int bo0 = 2*e0+8*d2-f0, bo1 = 2*e1+8*d1-f1, bo2 = 2*e2+8*d0-f2, bo3 = 2*e3+8*d3-f3;
+
+            int doff = destOff + col;
+            dest[doff]=Sat(b0+bo0); doff+=linesize;
+            dest[doff]=Sat(b2+bo1); doff+=linesize;
+            dest[doff]=Sat(b4+bo2); doff+=linesize;
+            dest[doff]=Sat(b6+bo3); doff+=linesize;
+            dest[doff]=Sat(b6-bo3); doff+=linesize;
+            dest[doff]=Sat(b4-bo2); doff+=linesize;
+            dest[doff]=Sat(b2-bo1); doff+=linesize;
+            dest[doff]=Sat(b0-bo0);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte Sat(int v) => (byte)Math.Clamp((v >> 6) + 128, 0, 255);
+
+    // ── Main decode entry point ───────────────────────────────────────────────
+    // Returns the persistent internal YCbCrPlanes (do NOT Dispose the return value).
+    // Returns null only if the frame size is invalid.
+
+    public YCbCrPlanes? Decode(ReadOnlySpan<byte> data, int w, int h, int subenc)
+    {
+        if (w <= 0 || h <= 0 || (w % 16) != 0 || (h % 16) != 0) return null;
+
+        int ccr = subenc & 0xF;
+        if (ccr != _currentCcr) { _currentCcr = ccr; SetupQuantTables(ccr); }
+
+        // Initialise or resize persistent planes
+        if (_planes is null || _planes.Width != w || _planes.Height != h)
+        {
+            _planes?.Dispose();
+            _planes = new YCbCrPlanes(w, h);
+        }
+
+        // Init bit reader (copy span into reusable buffer to avoid span-as-field restriction)
+        if (_streamBuf.Length < data.Length) _streamBuf = new byte[data.Length];
+        data.CopyTo(_streamBuf);
+        _streamLen = data.Length;
+        _streamOff = 0;
+        _bitBuf    = 0;
+        _bitCount  = 0;
+
+        int tilesX = w / 16;
+        int yStride = w;
+        int cStride = w / 2;
+
+        unsafe
+        {
+            fixed (byte* pY = _planes.YSpan, pCb = _planes.CbSpan, pCr = _planes.CrSpan)
+            {
+                int lineOffsetY = 16 * yStride - w;
+                int lineOffsetC = 8  * cStride - cStride; // = cStride * (8-1) - (cStride - w/2)
+                // Simplified: after 8 chroma rows of a tile band we advance to next band.
+                // offsetC spans 8 rows at cStride pitch. lineOffsetC = 8*cStride - tilesX*8
+                // = 8*cStride - w/2  (since tilesX*8 = w/2)
+                lineOffsetC = 8 * cStride - (w / 2);
+
+                int offsetY12 = 0;                    // top-left 8×8 of luma tile
+                int offsetY34 = 8 * yStride;          // bottom-left 8×8 of luma tile
+                int offsetC   = 0;
+                int lineCounter = 0;
+
+                int skipCount = ReadHiveSkip();
+
+                for (int ty = 0; ty < h; ty += 16)
+                for (int tx = 0; tx < w; tx += 16)
+                {
+                    if (skipCount < 0) goto done;
+
+                    // Reset DC per tile (eHIVE bitstreamVersion ≥ 1)
+                    int lastDcY = 0, lastDcCb = 0, lastDcCr = 0;
+
+                    if (skipCount > 0)
+                    {
+                        // Tile unchanged from previous frame — advance pointers only
+                        if (lineCounter == tilesX) { lineCounter = 0; offsetY12 += lineOffsetY; offsetY34 += lineOffsetY; offsetC += lineOffsetC; }
+                        offsetY12 += 16; offsetY34 += 16; offsetC += 8;
+                        lineCounter++;
+                        skipCount--;
+                    }
+                    else
+                    {
+                        ReadHiveTileByteCount();
+
+                        for (int color = 0; color <= 5; color++)
+                        {
+                            int bOff = color * 64;
+                            Array.Clear(_blockBuf, bOff, 64);
+
+                            if (lineCounter == tilesX) { lineCounter = 0; offsetY12 += lineOffsetY; offsetY34 += lineOffsetY; offsetC += lineOffsetC; }
+
+                            if (color <= 3)
+                            {
+                                int pCurOff;
+                                if (color <= 1) { pCurOff = offsetY12; offsetY12 += 8; }
+                                else            { pCurOff = offsetY34; offsetY34 += 8; }
+                                lastDcY = DecodeBlock(bOff, lastDcY, _yqTable, _huffDcL, _huffAcL);
+                                InverseICT(bOff, pY, pCurOff, yStride);
+                            }
+                            else if (color == 4)
+                            {
+                                lastDcCb = DecodeBlock(bOff, lastDcCb, _cqTable, _huffDcC, _huffAcC);
+                                InverseICT(bOff, pCb, offsetC, cStride);
+                            }
+                            else
+                            {
+                                lastDcCr = DecodeBlock(bOff, lastDcCr, _cqTable, _huffDcC, _huffAcC);
+                                InverseICT(bOff, pCr, offsetC, cStride);
+                                offsetC += 8;
+                            }
+                        }
+
+                        lineCounter++;
+                        ReadHiveTilePadding();
+                        skipCount = ReadHiveSkip();
+                    }
+                }
+                done:;
+            }
+        }
+
+        return _planes;
+    }
+
+    // ── Huffman code tables (decompiled from Raritan Java client by SwiftKVM) ─
+
+    private static readonly HuffCode[] LumDcCodes = [
+        new(2,  0), new(3,   2), new(3,    3), new(3,   4), new(3,    5), new(3,   6),
+        new(4, 14), new(5,  30), new(6,   62), new(7, 126), new(8,  254), new(9, 510),
+        new(10, 1022)
     ];
 
-    private static readonly byte[] AcChromaValues = [
-        0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,0x07,0x61,
-        0x71,0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xA1,0xB1,0xC1,0x09,0x23,0x33,
-        0x52,0xF0,0x15,0x62,0x72,0xD1,0x0A,0x16,0x24,0x34,0xE1,0x25,0xF1,0x17,0x18,
-        0x19,0x1A,0x26,0x27,0x28,0x29,0x2A,0x35,0x36,0x37,0x38,0x39,0x3A,0x43,0x44,
-        0x45,0x46,0x47,0x48,0x49,0x4A,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5A,0x63,
-        0x64,0x65,0x66,0x67,0x68,0x69,0x6A,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7A,
-        0x82,0x83,0x84,0x85,0x86,0x87,0x88,0x89,0x8A,0x92,0x93,0x94,0x95,0x96,0x97,
-        0x98,0x99,0x9A,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,0xA8,0xA9,0xAA,0xB2,0xB3,0xB4,
-        0xB5,0xB6,0xB7,0xB8,0xB9,0xBA,0xC2,0xC3,0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,
-        0xD2,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,
-        0xE8,0xE9,0xEA,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,0xF9,0xFA
+    private static readonly HuffCode[] ChromaDcCodes = [
+        new(2, 0), new(2,  1), new(2,   2), new(3,   6), new(4,  14), new(5,  30),
+        new(6, 62), new(7, 126), new(8, 254), new(9, 510), new(10, 1022), new(11, 2046)
     ];
-}
 
-// ── Bitstream reader (HIVE format) ──────────────────────────────────────────
+    private static readonly HuffCode[] LumAcCodes = [
+        // Row 0 (run=0, sizes 0..10) + padding to 16
+        new(4,10), new(2,0), new(2,1), new(3,4), new(4,11), new(5,26), new(7,120), new(8,248),
+        new(10,1014), new(16,65410), new(16,65411),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 1 (run=1)
+        new(0,0), new(4,12), new(5,27), new(7,121), new(9,502), new(11,2038),
+        new(16,65412), new(16,65413), new(16,65414), new(16,65415), new(16,65416),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 2 (run=2)
+        new(0,0), new(5,28), new(8,249), new(10,1015), new(12,4084),
+        new(16,65417), new(16,65418), new(16,65419), new(16,65420), new(16,65421), new(16,65422),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 3 (run=3)
+        new(0,0), new(6,58), new(9,503), new(12,4085),
+        new(16,65423), new(16,65424), new(16,65425), new(16,65426), new(16,65427), new(16,65428), new(16,65429),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 4 (run=4)
+        new(0,0), new(6,59), new(10,1016),
+        new(16,65430), new(16,65431), new(16,65432), new(16,65433), new(16,65434), new(16,65435), new(16,65436), new(16,65437),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 5 (run=5)
+        new(0,0), new(7,122), new(11,2039),
+        new(16,65438), new(16,65439), new(16,65440), new(16,65441), new(16,65442), new(16,65443), new(16,65444), new(16,65445),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 6 (run=6)
+        new(0,0), new(7,123), new(12,4086),
+        new(16,65446), new(16,65447), new(16,65448), new(16,65449), new(16,65450), new(16,65451), new(16,65452), new(16,65453),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 7 (run=7)
+        new(0,0), new(8,250), new(12,4087),
+        new(16,65454), new(16,65455), new(16,65456), new(16,65457), new(16,65458), new(16,65459), new(16,65460), new(16,65461),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 8 (run=8)
+        new(0,0), new(9,504), new(15,32704),
+        new(16,65462), new(16,65463), new(16,65464), new(16,65465), new(16,65466), new(16,65467), new(16,65468), new(16,65469),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 9 (run=9)
+        new(0,0), new(9,505),
+        new(16,65470), new(16,65471), new(16,65472), new(16,65473), new(16,65474), new(16,65475), new(16,65476), new(16,65477), new(16,65478),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 10 (run=10)
+        new(0,0), new(9,506),
+        new(16,65479), new(16,65480), new(16,65481), new(16,65482), new(16,65483), new(16,65484), new(16,65485), new(16,65486), new(16,65487),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 11 (run=11)
+        new(0,0), new(10,1017),
+        new(16,65488), new(16,65489), new(16,65490), new(16,65491), new(16,65492), new(16,65493), new(16,65494), new(16,65495), new(16,65496),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 12 (run=12)
+        new(0,0), new(10,1018),
+        new(16,65497), new(16,65498), new(16,65499), new(16,65500), new(16,65501), new(16,65502), new(16,65503), new(16,65504), new(16,65505),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 13 (run=13)
+        new(0,0), new(11,2040),
+        new(16,65506), new(16,65507), new(16,65508), new(16,65509), new(16,65510), new(16,65511), new(16,65512), new(16,65513), new(16,65514),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 14 (run=14)
+        new(0,0), new(16,65515), new(16,65516), new(16,65517), new(16,65518), new(16,65519),
+        new(16,65520), new(16,65521), new(16,65522), new(16,65523), new(16,65524),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 15 (run=15)
+        new(11,2041),
+        new(16,65525), new(16,65526), new(16,65527), new(16,65528), new(16,65529),
+        new(16,65530), new(16,65531), new(16,65532), new(16,65533), new(16,65534),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+    ];
 
-internal ref struct BitReader
-{
-    private readonly ReadOnlySpan<byte> _data;
-    private int _pos;
-    private uint _bits;
-    private int  _bitsLeft;
-
-    public BitReader(ReadOnlySpan<byte> data) { _data = data; _pos = 0; _bits = 0; _bitsLeft = 0; }
-
-    private void Refill()
-    {
-        while (_bitsLeft <= 24 && _pos < _data.Length)
-        {
-            _bits = (_bits << 8) | _data[_pos++];
-            _bitsLeft += 8;
-        }
-    }
-
-    public int ReadBit()
-    {
-        if (_bitsLeft == 0) Refill();
-        if (_bitsLeft == 0) return -1;
-        _bitsLeft--;
-        return (int)((_bits >> _bitsLeft) & 1);
-    }
-
-    public int ReadBits(int n)
-    {
-        if (n == 0) return 0;
-        Refill();
-        if (_bitsLeft < n) return -1;
-        _bitsLeft -= n;
-        return (int)((_bits >> _bitsLeft) & ((1u << n) - 1));
-    }
-
-    public int ReadSignedBits(int n)
-    {
-        if (n == 0) return 0;
-        int v = ReadBits(n);
-        if (v < 0) return 0;
-        return (v & (1 << (n - 1))) != 0 ? v : v - (1 << n) + 1;
-    }
-
-    public int DecodeHuff(HuffTable table)
-    {
-        int code = 0;
-        for (int len = 1; len <= table.MaxLen; len++)
-        {
-            int bit = ReadBit();
-            if (bit < 0) return -1;
-            code = (code << 1) | bit;
-            int sym = table.Lookup(code, len, out bool found);
-            if (found) return sym;
-        }
-        return -1;
-    }
-
-    /// Read the HIVE skip count (variable-length prefix code).
-    public int ReadHiveSkip()
-    {
-        // HIVE: 0 = no skip; 1x = 1-bit skip; 01xx = 2-4; etc.
-        // Simplified: read up to 7 bits
-        int skip = 0;
-        for (int i = 0; i < 7; i++)
-        {
-            int b = ReadBit();
-            if (b <= 0) break;
-            skip = (skip << 1) | b;
-        }
-        return skip;
-    }
+    private static readonly HuffCode[] ChromaAcCodes = [
+        // Row 0 (run=0)
+        new(2,0), new(2,1), new(3,4), new(4,10), new(5,24), new(5,25), new(6,56), new(7,120),
+        new(9,500), new(10,1014), new(12,4084),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 1 (run=1)
+        new(0,0), new(4,11), new(6,57), new(8,246), new(9,501), new(11,2038), new(12,4085),
+        new(16,65416), new(16,65417), new(16,65418), new(16,65419),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 2 (run=2)
+        new(0,0), new(5,26), new(8,247), new(10,1015), new(12,4086), new(15,32706),
+        new(16,65420), new(16,65421), new(16,65422), new(16,65423), new(16,65424),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 3 (run=3)
+        new(0,0), new(5,27), new(8,248), new(10,1016), new(12,4087),
+        new(16,65425), new(16,65426), new(16,65427), new(16,65428), new(16,65429), new(16,65430),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 4 (run=4)
+        new(0,0), new(6,58), new(9,502),
+        new(16,65431), new(16,65432), new(16,65433), new(16,65434), new(16,65435), new(16,65436), new(16,65437), new(16,65438),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 5 (run=5)
+        new(0,0), new(6,59), new(10,1017),
+        new(16,65439), new(16,65440), new(16,65441), new(16,65442), new(16,65443), new(16,65444), new(16,65445), new(16,65446),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 6 (run=6)
+        new(0,0), new(7,121), new(11,2039),
+        new(16,65447), new(16,65448), new(16,65449), new(16,65450), new(16,65451), new(16,65452), new(16,65453), new(16,65454),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 7 (run=7)
+        new(0,0), new(7,122), new(11,2040),
+        new(16,65455), new(16,65456), new(16,65457), new(16,65458), new(16,65459), new(16,65460), new(16,65461), new(16,65462),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 8 (run=8)
+        new(0,0), new(8,249),
+        new(16,65463), new(16,65464), new(16,65465), new(16,65466), new(16,65467), new(16,65468), new(16,65469), new(16,65470), new(16,65471),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 9 (run=9)
+        new(0,0), new(9,503),
+        new(16,65472), new(16,65473), new(16,65474), new(16,65475), new(16,65476), new(16,65477), new(16,65478), new(16,65479), new(16,65480),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 10 (run=10)
+        new(0,0), new(9,504),
+        new(16,65481), new(16,65482), new(16,65483), new(16,65484), new(16,65485), new(16,65486), new(16,65487), new(16,65488), new(16,65489),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 11 (run=11)
+        new(0,0), new(9,505),
+        new(16,65490), new(16,65491), new(16,65492), new(16,65493), new(16,65494), new(16,65495), new(16,65496), new(16,65497), new(16,65498),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 12 (run=12)
+        new(0,0), new(9,506),
+        new(16,65499), new(16,65500), new(16,65501), new(16,65502), new(16,65503), new(16,65504), new(16,65505), new(16,65506), new(16,65507),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 13 (run=13)
+        new(0,0), new(11,2041),
+        new(16,65508), new(16,65509), new(16,65510), new(16,65511), new(16,65512), new(16,65513), new(16,65514), new(16,65515), new(16,65516),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 14 (run=14)
+        new(0,0), new(14,16352),
+        new(16,65517), new(16,65518), new(16,65519), new(16,65520), new(16,65521), new(16,65522), new(16,65523), new(16,65524), new(16,65525),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+        // Row 15 (run=15)
+        new(10,1018), new(15,32707),
+        new(16,65526), new(16,65527), new(16,65528), new(16,65529), new(16,65530), new(16,65531), new(16,65532), new(16,65533), new(16,65534),
+        new(0,0), new(0,0), new(0,0), new(0,0), new(0,0),
+    ];
 }

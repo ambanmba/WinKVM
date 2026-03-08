@@ -26,13 +26,23 @@ public sealed class YCbCrPlanes : IDisposable
     public unsafe byte* Cb => _disposed ? null : (byte*)_cbBuf;
     public unsafe byte* Cr => _disposed ? null : (byte*)_crBuf;
 
+    // Span accessors for fixed() pinning in ICTDecoder
+    public unsafe Span<byte> YSpan  => _disposed ? Span<byte>.Empty : new Span<byte>((byte*)_yBuf,  YSize);
+    public unsafe Span<byte> CbSpan => _disposed ? Span<byte>.Empty : new Span<byte>((byte*)_cbBuf, CSize);
+    public unsafe Span<byte> CrSpan => _disposed ? Span<byte>.Empty : new Span<byte>((byte*)_crBuf, CSize);
+
     public unsafe YCbCrPlanes(int width, int height)
     {
         Width  = width;
         Height = height;
-        _yBuf  = (nint)NativeMemory.AlignedAlloc((nuint)YSize,  16);
-        _cbBuf = (nint)NativeMemory.AlignedAlloc((nuint)CSize,  16);
-        _crBuf = (nint)NativeMemory.AlignedAlloc((nuint)CSize,  16);
+        _yBuf  = (nint)NativeMemory.AlignedAlloc((nuint)YSize, 16);
+        _cbBuf = (nint)NativeMemory.AlignedAlloc((nuint)CSize, 16);
+        _crBuf = (nint)NativeMemory.AlignedAlloc((nuint)CSize, 16);
+        // Init to neutral gray (Y=128, Cb=128, Cr=128) so skipped inter-frame tiles
+        // show as gray rather than garbage on the first frame.
+        NativeMemory.Fill((void*)_yBuf,  (nuint)YSize, 128);
+        NativeMemory.Fill((void*)_cbBuf, (nuint)CSize, 128);
+        NativeMemory.Fill((void*)_crBuf, (nuint)CSize, 128);
     }
 
     public void Dispose()

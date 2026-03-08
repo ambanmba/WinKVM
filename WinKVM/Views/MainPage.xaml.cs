@@ -14,6 +14,7 @@ namespace WinKVM.Views;
 public sealed partial class MainPage : Page
 {
     private readonly ERICSession  _session     = new();
+    public  ERICSession           Session      => _session;
     private readonly ProfileStore _profileStore = new();
     private AgentLoop? _agentLoop;
 
@@ -33,12 +34,7 @@ public sealed partial class MainPage : Page
         // Wire up renderer
         _session.Renderer = KvmRenderer;
 
-        // Wire keyboard proxy using AddHandler(handledEventsToo:true) so TextBox
-        // internal key handling (backspace, etc.) doesn't swallow our events.
-        KeyboardProxy.AddHandler(KeyDownEvent, new KeyEventHandler(KvmRenderer_KeyDown), handledEventsToo: true);
-        KeyboardProxy.AddHandler(KeyUpEvent,   new KeyEventHandler(KvmRenderer_KeyUp),   handledEventsToo: true);
-        // Clear any character the TextBox might accept before we handle it
-        KeyboardProxy.TextChanging += (tb, _) => { if (tb.Text.Length > 0) tb.Text = ""; };
+        // Keyboard input is handled via Win32 HWND subclassing in MainWindow.
     }
 
     // ── Session state ─────────────────────────────────────────────────────────
@@ -69,10 +65,6 @@ public sealed partial class MainPage : Page
             {
                 ConnectingText.Text = "";
                 InitAgentLoop();
-                // Delay focus until after the layout pass so KeyboardProxy is visible
-                DispatcherQueue.TryEnqueue(
-                    Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
-                    () => KeyboardProxy.Focus(FocusState.Programmatic));
             }
             else if (state == SessionState.Disconnected || state is SessionState)
             {
@@ -188,7 +180,6 @@ public sealed partial class MainPage : Page
     {
         if (_session.State != SessionState.Connected) return;
         KvmRenderer.CapturePointer(e.Pointer);
-        KeyboardProxy.Focus(FocusState.Pointer); // reclaim keyboard focus on click
         SendMouseEvent(e);
     }
 

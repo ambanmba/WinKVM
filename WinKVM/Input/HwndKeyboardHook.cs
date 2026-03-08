@@ -49,13 +49,24 @@ internal sealed class HwndKeyboardHook : IDisposable
         _hookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(null), 0);
     }
 
+    private static readonly string _log = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winkvm_kbd2.log");
+    private int _logCount;
+
     private nint LLProc(int nCode, nint wParam, nint lParam)
     {
-        if (nCode >= 0 && GetForegroundWindow() == _mainHwnd)
+        if (nCode >= 0)
         {
+            var fg = GetForegroundWindow();
             var kbs = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-            if (wParam is WM_KEYDOWN or WM_SYSKEYDOWN) _onKey(kbs.vkCode, true);
-            else if (wParam is WM_KEYUP   or WM_SYSKEYUP)  _onKey(kbs.vkCode, false);
+            if (_logCount++ < 20)
+                File.AppendAllText(_log,
+                    $"[{DateTime.Now:HH:mm:ss}] nCode={nCode} wParam=0x{wParam:X} vk=0x{kbs.vkCode:X} fg=0x{fg:X} main=0x{_mainHwnd:X} match={(fg==_mainHwnd)}\n");
+            if (fg == _mainHwnd)
+            {
+                if (wParam is WM_KEYDOWN or WM_SYSKEYDOWN) _onKey(kbs.vkCode, true);
+                else if (wParam is WM_KEYUP or WM_SYSKEYUP) _onKey(kbs.vkCode, false);
+            }
         }
         return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
     }

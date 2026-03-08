@@ -67,8 +67,9 @@ public sealed class ERICSession : INotifyPropertyChanged
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
 
-    // Last pointer position — keepalive sends to this position so it doesn't move the cursor
-    private ushort _lastPtrX, _lastPtrY;
+    // Last pointer position — keepalive sends to this position so it doesn't move the cursor.
+    // Initialized to centre; updated on every real pointer event.
+    private ushort _lastPtrX = 1280, _lastPtrY = 720;
 
     // Decoders
     private readonly HextileDecoder _hextileDecoder = new();
@@ -310,6 +311,8 @@ public sealed class ERICSession : INotifyPropertyChanged
                         ushort fbW = (ushort)(_framebuffer?.Width ?? 1920);
                         ushort fbH = (ushort)(_framebuffer?.Height ?? 1080);
                         await SendFramebufferUpdateRequestAsync(0, 0, fbW, fbH, incremental: false, ct);
+                        _lastPtrX = (ushort)(fbW / 2);
+                        _lastPtrY = (ushort)(fbH / 2);
                         State = SessionState.Connected;
                         StatusMessage = $"Connected ({fbW}x{fbH})";
                         _ = PingLoopAsync(ct);           // keepalive: ping every 10 s

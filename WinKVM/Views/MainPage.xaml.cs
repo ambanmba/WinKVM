@@ -18,6 +18,21 @@ public sealed partial class MainPage : Page
     private readonly ProfileStore _profileStore = new();
     private AgentLoop? _agentLoop;
     private DispatcherTimer? _fpsTimer;
+    private DispatcherTimer? _keyIndicatorTimer;
+
+    public void ShowKeyIndicator(string keyName)
+    {
+        FpsText.Text = $"⌨ {keyName}";
+        _keyIndicatorTimer?.Stop();
+        _keyIndicatorTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
+        _keyIndicatorTimer.Tick += (_, _) =>
+        {
+            _keyIndicatorTimer?.Stop();
+            _keyIndicatorTimer = null;
+            FpsText.Text = $"{_session.CurrentFps:F0}/{_session.AvgFps:F0} fps";
+        };
+        _keyIndicatorTimer.Start();
+    }
 
     public MainPage()
     {

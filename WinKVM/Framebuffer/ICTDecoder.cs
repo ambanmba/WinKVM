@@ -91,8 +91,14 @@ public sealed class ICTDecoder : IDisposable
     private readonly int[] _yqTable  = new int[64];
     private readonly int[] _cqTable  = new int[64];
 
-    // ── Per-tile coefficient scratch buffer (6 blocks × 64 = 384 Int16) ──────
-    private readonly short[] _blockBuf = new short[6 * 64];
+    // ── Coefficient storage for two-pass parallel decode ──────────────────────
+    // Phase 1 (serial):  Huffman decode → _allCoeffs
+    // Phase 2 (parallel): InverseICT across all decoded blocks → output planes
+    // Reused across frames to avoid per-frame allocation.
+    private short[] _allCoeffs = [];
+
+    // Job list for phase 2: (coeffOffset, planeId 0=Y/1=Cb/2=Cr, destOffset, linesize)
+    private readonly List<(int cOff, int pid, int dOff, int ls)> _idctJobs = [];
 
     // ── Persistent inter-frame planes (skipped tiles keep previous frame) ─────
     private YCbCrPlanes? _planes;
@@ -254,9 +260,10 @@ public sealed class ICTDecoder : IDisposable
 
     // ── Huffman block decode → coefficients in blockBuf[off..off+64] ─────────
 
-    private int DecodeBlock(int off, int lastDc, int[] qTable, HuffEntry[] dcTab, HuffEntry[] acTab)
+    // DecodeBlockInto writes into a caller-supplied array at offset `off`.
+    // Used in Phase 1 (serial) — thread-safe since each block has a unique offset.
+    private int DecodeBlockInto(short[] buf, int off, int lastDc, int[] qTable, HuffEntry[] dcTab, HuffEntry[] acTab)
     {
-        // DC coefficient
         EnsureBits(16);
         int dcIdx = PeekBits(16);
         int cat = dcTab[dcIdx].Cat;
@@ -264,9 +271,8 @@ public sealed class ICTDecoder : IDisposable
         if (cat == 12) return lastDc; // end-of-package sentinel
 
         int dc = lastDc + GetRealValue(cat);
-        _blockBuf[off] = (short)((int)((long)dc * qTable[0]) >> 10);
+        buf[off] = (short)((int)((long)dc * qTable[0]) >> 10);
 
-        // AC coefficients
         int count = 0;
         while (count < 64)
         {
@@ -282,7 +288,7 @@ public sealed class ICTDecoder : IDisposable
             if (count < 64)
             {
                 int t = Zigzag[count];
-                _blockBuf[t + off] = (short)((int)((long)qTable[t] * value) >> 10);
+                buf[t + off] = (short)((int)((long)qTable[t] * value) >> 10);
             }
         }
         return dc;
@@ -292,20 +298,24 @@ public sealed class ICTDecoder : IDisposable
     // Reads 8×8 Int16 block from blockBuf[tileOff..], writes bytes to dest.
     // Final output: saturate((value >> 6) + 128) → UInt8.
 
-    private unsafe void InverseICT(int tileOff, byte* dest, int destOff, int linesize)
+    // Static + stackalloc scratch → fully thread-safe for Parallel.For.
+    private static unsafe void InverseICT(short[] src, int tileOff, byte* dest, int destOff, int linesize)
     {
-        // Row pass
+        // Row pass — write into stack-allocated scratch (thread-local, no shared state)
+        Span<short> scratch = stackalloc short[64];
+
         for (int row = 0; row < 8; row++)
         {
             int off = tileOff + 8 * row;
-            int x0 = _blockBuf[off], x1 = _blockBuf[off+1], x2 = _blockBuf[off+2], x3 = _blockBuf[off+3];
-            int x4 = _blockBuf[off+4], x5 = _blockBuf[off+5], x6 = _blockBuf[off+6], x7 = _blockBuf[off+7];
+            int x0 = src[off], x1 = src[off+1], x2 = src[off+2], x3 = src[off+3];
+            int x4 = src[off+4], x5 = src[off+5], x6 = src[off+6], x7 = src[off+7];
 
             if ((x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0)
             {
-                short s = _blockBuf[off];
-                _blockBuf[off+1]=_blockBuf[off+2]=_blockBuf[off+3]=_blockBuf[off+4]=
-                _blockBuf[off+5]=_blockBuf[off+6]=_blockBuf[off+7]=s;
+                short s = src[off];
+                int sr = row * 8;
+                scratch[sr]=scratch[sr+1]=scratch[sr+2]=scratch[sr+3]=
+                scratch[sr+4]=scratch[sr+5]=scratch[sr+6]=scratch[sr+7]=s;
                 continue;
             }
 
@@ -318,18 +328,18 @@ public sealed class ICTDecoder : IDisposable
             int f0 = -8*x1+x3, f1 = x1+8*x5, f2 = x7+8*x3, f3 = x5+8*x7;
             int bo0 = 2*e0+8*d2-f0, bo1 = 2*e1+8*d1-f1, bo2 = 2*e2+8*d0-f2, bo3 = 2*e3+8*d3-f3;
 
-            _blockBuf[off+0] = (short)(b0+bo0); _blockBuf[off+7] = (short)(b0-bo0);
-            _blockBuf[off+1] = (short)(b2+bo1); _blockBuf[off+6] = (short)(b2-bo1);
-            _blockBuf[off+2] = (short)(b4+bo2); _blockBuf[off+5] = (short)(b4-bo2);
-            _blockBuf[off+3] = (short)(b6+bo3); _blockBuf[off+4] = (short)(b6-bo3);
+            int sr2 = row * 8;
+            scratch[sr2+0] = (short)(b0+bo0); scratch[sr2+7] = (short)(b0-bo0);
+            scratch[sr2+1] = (short)(b2+bo1); scratch[sr2+6] = (short)(b2-bo1);
+            scratch[sr2+2] = (short)(b4+bo2); scratch[sr2+5] = (short)(b4-bo2);
+            scratch[sr2+3] = (short)(b6+bo3); scratch[sr2+4] = (short)(b6-bo3);
         }
 
-        // Column pass + saturating output
+        // Column pass — reads from scratch (stack-local), writes bytes to dest
         for (int col = 0; col < 8; col++)
         {
-            int off = tileOff + col;
-            int x0 = _blockBuf[off],    x1 = _blockBuf[off+8],  x2 = _blockBuf[off+16], x3 = _blockBuf[off+24];
-            int x4 = _blockBuf[off+32], x5 = _blockBuf[off+40], x6 = _blockBuf[off+48], x7 = _blockBuf[off+56];
+            int x0 = scratch[col],    x1 = scratch[col+8],  x2 = scratch[col+16], x3 = scratch[col+24];
+            int x4 = scratch[col+32], x5 = scratch[col+40], x6 = scratch[col+48], x7 = scratch[col+56];
 
             if ((x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0)
             {
@@ -374,40 +384,42 @@ public sealed class ICTDecoder : IDisposable
         int ccr = subenc & 0xF;
         if (ccr != _currentCcr) { _currentCcr = ccr; SetupQuantTables(ccr); }
 
-        // Initialise or resize persistent planes
         if (_planes is null || _planes.Width != w || _planes.Height != h)
         {
             _planes?.Dispose();
             _planes = new YCbCrPlanes(w, h);
         }
 
-        // Init bit reader (copy span into reusable buffer to avoid span-as-field restriction)
         if (_streamBuf.Length < data.Length) _streamBuf = new byte[data.Length];
         data.CopyTo(_streamBuf);
         _streamLen = data.Length;
-        _streamOff = 0;
-        _bitBuf    = 0;
-        _bitCount  = 0;
+        _streamOff = 0; _bitBuf = 0; _bitCount = 0;
 
-        int tilesX = w / 16;
+        int tilesX  = w / 16;
         int yStride = w;
         int cStride = w / 2;
+        int noTiles = tilesX * (h / 16);
 
+        // Ensure coefficient buffer is large enough for all blocks this frame.
+        int needed = noTiles * 6 * 64;
+        if (_allCoeffs.Length < needed) _allCoeffs = new short[needed];
+
+        _idctJobs.Clear();
+        _idctJobs.Capacity = Math.Max(_idctJobs.Capacity, noTiles * 6);
+
+        // ── Phase 1: serial Huffman decode → coefficient buffer + job list ──────
         unsafe
         {
-            fixed (byte* pY = _planes.YSpan, pCb = _planes.CbSpan, pCr = _planes.CrSpan)
+            // _planes uses NativeMemory (unmanaged) — pointers are GC-stable, no fixed needed.
+            byte* pY  = _planes.Y;
+            byte* pCb = _planes.Cb;
+            byte* pCr = _planes.Cr;
+
             {
                 int lineOffsetY = 16 * yStride - w;
-                int lineOffsetC = 8  * cStride - cStride; // = cStride * (8-1) - (cStride - w/2)
-                // Simplified: after 8 chroma rows of a tile band we advance to next band.
-                // offsetC spans 8 rows at cStride pitch. lineOffsetC = 8*cStride - tilesX*8
-                // = 8*cStride - w/2  (since tilesX*8 = w/2)
-                lineOffsetC = 8 * cStride - (w / 2);
-
-                int offsetY12 = 0;                    // top-left 8×8 of luma tile
-                int offsetY34 = 8 * yStride;          // bottom-left 8×8 of luma tile
-                int offsetC   = 0;
-                int lineCounter = 0;
+                int lineOffsetC = 8 * cStride - (w / 2);
+                int offsetY12 = 0, offsetY34 = 8 * yStride, offsetC = 0;
+                int lineCounter = 0, tileIdx = 0;
 
                 int skipCount = ReadHiveSkip();
 
@@ -416,16 +428,13 @@ public sealed class ICTDecoder : IDisposable
                 {
                     if (skipCount < 0) goto done;
 
-                    // Reset DC per tile (eHIVE bitstreamVersion ≥ 1)
                     int lastDcY = 0, lastDcCb = 0, lastDcCr = 0;
 
                     if (skipCount > 0)
                     {
-                        // Tile unchanged from previous frame — advance pointers only
                         if (lineCounter == tilesX) { lineCounter = 0; offsetY12 += lineOffsetY; offsetY34 += lineOffsetY; offsetC += lineOffsetC; }
                         offsetY12 += 16; offsetY34 += 16; offsetC += 8;
-                        lineCounter++;
-                        skipCount--;
+                        lineCounter++; skipCount--;
                     }
                     else
                     {
@@ -433,38 +442,62 @@ public sealed class ICTDecoder : IDisposable
 
                         for (int color = 0; color <= 5; color++)
                         {
-                            int bOff = color * 64;
-                            Array.Clear(_blockBuf, bOff, 64);
+                            int cOff = (tileIdx * 6 + color) * 64;
+                            Array.Clear(_allCoeffs, cOff, 64);
 
                             if (lineCounter == tilesX) { lineCounter = 0; offsetY12 += lineOffsetY; offsetY34 += lineOffsetY; offsetC += lineOffsetC; }
 
                             if (color <= 3)
                             {
-                                int pCurOff;
-                                if (color <= 1) { pCurOff = offsetY12; offsetY12 += 8; }
-                                else            { pCurOff = offsetY34; offsetY34 += 8; }
-                                lastDcY = DecodeBlock(bOff, lastDcY, _yqTable, _huffDcL, _huffAcL);
-                                InverseICT(bOff, pY, pCurOff, yStride);
+                                int dOff;
+                                if (color <= 1) { dOff = offsetY12; offsetY12 += 8; }
+                                else            { dOff = offsetY34; offsetY34 += 8; }
+                                lastDcY = DecodeBlockInto(_allCoeffs, cOff, lastDcY, _yqTable, _huffDcL, _huffAcL);
+                                _idctJobs.Add((cOff, 0, dOff, yStride));
                             }
                             else if (color == 4)
                             {
-                                lastDcCb = DecodeBlock(bOff, lastDcCb, _cqTable, _huffDcC, _huffAcC);
-                                InverseICT(bOff, pCb, offsetC, cStride);
+                                lastDcCb = DecodeBlockInto(_allCoeffs, cOff, lastDcCb, _cqTable, _huffDcC, _huffAcC);
+                                _idctJobs.Add((cOff, 1, offsetC, cStride));
                             }
                             else
                             {
-                                lastDcCr = DecodeBlock(bOff, lastDcCr, _cqTable, _huffDcC, _huffAcC);
-                                InverseICT(bOff, pCr, offsetC, cStride);
+                                lastDcCr = DecodeBlockInto(_allCoeffs, cOff, lastDcCr, _cqTable, _huffDcC, _huffAcC);
+                                _idctJobs.Add((cOff, 2, offsetC, cStride));
                                 offsetC += 8;
                             }
                         }
 
-                        lineCounter++;
+                        lineCounter++; tileIdx++;
                         ReadHiveTilePadding();
                         skipCount = ReadHiveSkip();
                     }
                 }
                 done:;
+
+                // ── Phase 2: parallel IDCT across all Snapdragon cores ─────────
+                // Threshold of 48 blocks (~8 tiles) amortises thread-pool overhead.
+                // Below that, sequential is faster (matches SwiftKVM's heuristic).
+                short[] coeffs = _allCoeffs;
+                var jobs = _idctJobs;
+
+                if (jobs.Count >= 48)
+                {
+                    System.Threading.Tasks.Parallel.For(0, jobs.Count, i =>
+                    {
+                        var (co, pid, dOff, ls) = jobs[i];
+                        byte* dest = pid == 0 ? pY : pid == 1 ? pCb : pCr;
+                        InverseICT(coeffs, co, dest, dOff, ls);
+                    });
+                }
+                else
+                {
+                    foreach (var (co, pid, dOff, ls) in jobs)
+                    {
+                        byte* dest = pid == 0 ? pY : pid == 1 ? pCb : pCr;
+                        InverseICT(coeffs, co, dest, dOff, ls);
+                    }
+                }
             }
         }
 

@@ -97,13 +97,26 @@ void CS(uint3 tid : SV_DispatchThreadID)
         // Chroma block (Cb or Cr)
         uint cw = (frameW + 1) / 2, ch = (frameH + 1) / 2;
         uint dstX = tileX * 8, dstY = tileY * 8;
-        RWTexture2D<unorm float> plane = (blockInTile == 4) ? cbPlane : crPlane;
-        [unroll] for (int row = 0; row < 8; row++)
-        [unroll] for (int col = 0; col < 8; col++)
+        // HLSL doesn't allow dynamic resource selection — use explicit if/else.
+        if (blockInTile == 4)
         {
-            uint px = dstX + col, py = dstY + row;
-            if (px < cw && py < ch)
-                plane[uint2(px, py)] = saturate((result[row*8+col] + 128.0) / 255.0);
+            [unroll] for (int row = 0; row < 8; row++)
+            [unroll] for (int col = 0; col < 8; col++)
+            {
+                uint px = dstX + col, py = dstY + row;
+                if (px < cw && py < ch)
+                    cbPlane[uint2(px, py)] = saturate((result[row*8+col] + 128.0) / 255.0);
+            }
+        }
+        else
+        {
+            [unroll] for (int row = 0; row < 8; row++)
+            [unroll] for (int col = 0; col < 8; col++)
+            {
+                uint px = dstX + col, py = dstY + row;
+                if (px < cw && py < ch)
+                    crPlane[uint2(px, py)] = saturate((result[row*8+col] + 128.0) / 255.0);
+            }
         }
     }
 }

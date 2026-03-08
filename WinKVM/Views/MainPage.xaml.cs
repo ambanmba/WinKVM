@@ -113,6 +113,9 @@ public sealed partial class MainPage : Page
     private void CtrlAltDelBtn_Click  (object s, RoutedEventArgs e) => _session.SendCtrlAltDel();
     private void ReconnectBtn_Click   (object s, RoutedEventArgs e) => _session.Reconnect();
     private void BackToLoginBtn_Click (object s, RoutedEventArgs e) => _session.Disconnect();
+    private void SharpnessSlider_ValueChanged(object s, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+        => KvmRenderer.Sharpness = (float)(e.NewValue / 100.0);
+
     private void DiagnosticsBtn_Click (object s, RoutedEventArgs e) { /* TODO */ }
     private void SettingsBtn_Click    (object s, RoutedEventArgs e) { /* TODO */ }
     private void SendTextBtn_Click    (object s, RoutedEventArgs e)

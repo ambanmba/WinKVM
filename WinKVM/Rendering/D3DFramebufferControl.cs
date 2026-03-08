@@ -37,8 +37,21 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
     private ID3D11VertexShader?       _fullscreenVS;
     private ID3D11ComputeShader?      _fillCS;
     private ID3D11ComputeShader?      _ictCS;
+    private ID3D11ComputeShader?      _casCS;    // CAS sharpening (Adreno GPU)
     private ID3D11SamplerState?       _linearSampler;
     private ID3D11RasterizerState?    _noCullRS; // no-cull for fullscreen triangle passes
+
+    // CAS intermediate texture: CAS reads from _displayTex, writes to _casOutTex,
+    // then Render() presents _casOutTex instead of _displayTex.
+    private ID3D11Texture2D?          _casOutTex;
+    private ID3D11ShaderResourceView? _casOutSRV;
+    private ID3D11UnorderedAccessView? _casOutUAV;
+
+    // CAS constants buffer: texSize(2) + sharpness(1) + pad(1) = 16 bytes
+    private ID3D11Buffer?             _casCB;
+
+    /// CAS sharpness 0.0–1.0 (0 = off, 0.6 = default). Set from UI.
+    public float Sharpness { get; set; } = 0.6f;
 
     // Display texture (BGRA8, persistent)
     private ID3D11Texture2D?          _displayTex;
@@ -158,12 +171,13 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         var ycbcrPSBytes   = CompileHlsl("YCbCr.hlsl",      "ps_5_0", "PS");
         var displayPSBytes = CompileHlsl("Display.hlsl",    "ps_5_0", "PS");
         var fillCSBytes    = CompileHlsl("HextileFill.hlsl","cs_5_0", "CS");
-        // ICTDequant.hlsl (GPU IDCT) not compiled — ICT decode is fully CPU-side.
+        var casCSBytes     = CompileHlsl("Sharpen.hlsl",    "cs_5_0", "CS");
 
         _fullscreenVS = _device.CreateVertexShader(vsBytes);
         _ycbcrPS      = _device.CreatePixelShader(ycbcrPSBytes);
         _displayPS    = _device.CreatePixelShader(displayPSBytes);
         _fillCS       = _device.CreateComputeShader(fillCSBytes);
+        _casCS        = _device.CreateComputeShader(casCSBytes);
     }
 
     private void CreateSamplers()
@@ -207,7 +221,21 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _displaySRV = _device.CreateShaderResourceView(_displayTex);
         _displayRTV = _device.CreateRenderTargetView(_displayTex);
         _displayUAV = _device.CreateUnorderedAccessView(_displayTex);
-        _displayW   = w; _displayH = h;
+
+        // CAS output texture (same format — CAS reads _displayTex, writes here)
+        _casOutTex?.Dispose(); _casOutSRV?.Dispose(); _casOutUAV?.Dispose();
+        _casOutTex = _device.CreateTexture2D(desc);
+        _casOutSRV = _device.CreateShaderResourceView(_casOutTex);
+        _casOutUAV = _device.CreateUnorderedAccessView(_casOutTex);
+
+        // CAS constants buffer: float2 texSize + float sharpness + float pad = 16 bytes
+        // Dynamic + WriteDiscard allows per-frame sharpness updates without a staging copy.
+        _casCB?.Dispose();
+        _casCB = _device.CreateBuffer(new float[] { w, h, Sharpness, 0f }.AsSpan(),
+            new BufferDescription { ByteWidth = 16u, Usage = ResourceUsage.Dynamic,
+                BindFlags = BindFlags.ConstantBuffer, CPUAccessFlags = CpuAccessFlags.Write });
+
+        _displayW = w; _displayH = h;
     }
 
     private void EnsureYCbCrTextures(int w, int h)
@@ -372,19 +400,49 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
     {
         if (_ctx is null || _rtv is null || _displaySRV is null) return;
 
-        var sc = _swapChain!.Description1;
-        var vp = new Viewport(0, 0, (float)sc.Width, (float)sc.Height);
-
         // Unbind display texture from any lingering RTV before using it as SRV
         _ctx.OMSetRenderTargets((ID3D11RenderTargetView?)null);
 
+        // ── CAS sharpening pass (Adreno GPU) ─────────────────────────────────
+        // Reads _displayTex (YCbCr-converted frame) → writes _casOutTex.
+        // Skipped when sharpness is zero or resources unavailable.
+        var presentSRV = _displaySRV; // default: present unsharpened
+        if (Sharpness > 0f && _casCS is not null && _casOutUAV is not null && _casCB is not null)
+        {
+            // Update sharpness constant via Map/WriteDiscard (Dynamic CB)
+            unsafe
+            {
+                var mapped = _ctx.Map(_casCB!, 0, MapMode.WriteDiscard);
+                var ptr = (float*)mapped.DataPointer;
+                ptr[0] = _displayW; ptr[1] = _displayH; ptr[2] = Sharpness; ptr[3] = 0f;
+                _ctx.Unmap(_casCB!, 0);
+            }
+
+            _ctx.CSSetShader(_casCS);
+            _ctx.CSSetShaderResources(0, [_displaySRV]);
+            _ctx.CSSetUnorderedAccessViews(0, [_casOutUAV]);
+            _ctx.CSSetConstantBuffers(0, [_casCB]);
+            _ctx.Dispatch(
+                (uint)((_displayW  + 7) / 8),
+                (uint)((_displayH + 7) / 8),
+                1);
+            _ctx.CSSetShader(null!);
+            _ctx.CSSetShaderResources(0, new ID3D11ShaderResourceView?[] { null });
+            _ctx.CSSetUnorderedAccessViews(0, new ID3D11UnorderedAccessView?[] { null });
+
+            presentSRV = _casOutSRV; // present the sharpened output
+        }
+
+        // ── Display pass (sharpened/unsharpened → swap chain) ─────────────────
+        var sc = _swapChain!.Description1;
+        var vp = new Viewport(0, 0, (float)sc.Width, (float)sc.Height);
         _ctx.OMSetRenderTargets(_rtv);
         _ctx.RSSetViewport(vp);
         _ctx.RSSetState(_noCullRS!);
         _ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         _ctx.VSSetShader(_fullscreenVS!);
         _ctx.PSSetShader(_displayPS!);
-        _ctx.PSSetShaderResources(0, [_displaySRV]);
+        _ctx.PSSetShaderResources(0, [presentSRV]);
         _ctx.PSSetSamplers(0, [_linearSampler!]);
         _ctx.Draw(3, 0);
 
@@ -443,8 +501,9 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _fillCmdSRV?.Dispose(); _fillCmdBuf?.Dispose();
         _displayUAV?.Dispose(); _displayRTV?.Dispose();
         _displaySRV?.Dispose(); _displayTex?.Dispose();
+        _casCB?.Dispose(); _casOutUAV?.Dispose(); _casOutSRV?.Dispose(); _casOutTex?.Dispose();
         _noCullRS?.Dispose(); _linearSampler?.Dispose();
-        _ictCS?.Dispose(); _fillCS?.Dispose();
+        _ictCS?.Dispose(); _fillCS?.Dispose(); _casCS?.Dispose();
         _ycbcrPS?.Dispose(); _displayPS?.Dispose(); _fullscreenVS?.Dispose();
         _rtv?.Dispose(); _swapChain?.Dispose();
         _ctx?.Dispose(); _device?.Dispose();

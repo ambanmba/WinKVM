@@ -20,6 +20,16 @@
             <AppBarSeparator/>
             <AppBarButton x:Name="AIAgentBtn"    Icon="People"     Label="AI Agent"        Click="AIAgentBtn_Click"/>
             <AppBarSeparator/>
+            <!-- CAS Sharpness: 0=off, 100=max (default 60) -->
+            <AppBarElementContainer VerticalContentAlignment="Center" Margin="4,0">
+                <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                    <TextBlock Text="Sharp" VerticalAlignment="Center" FontSize="11"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                    <Slider x:Name="SharpnessSlider" Width="80" Minimum="0" Maximum="100" Value="60"
+                            VerticalAlignment="Center" ValueChanged="SharpnessSlider_ValueChanged"/>
+                </StackPanel>
+            </AppBarElementContainer>
+            <AppBarSeparator/>
             <AppBarButton x:Name="DiagnosticsBtn" Icon="Setting"   Label="Diagnostics"     Click="DiagnosticsBtn_Click"/>
             <CommandBar.SecondaryCommands>
                 <AppBarButton Label="Settings" Click="SettingsBtn_Click"/>

@@ -32,13 +32,7 @@ public sealed partial class MainWindow : Window
             {
                 var key = (Windows.System.VirtualKey)vk;
                 if (Input.KeyboardHandler.RaritanKeyCode(key) is { } code)
-                {
                     _ = page.Session.SendKeyEventAsync(code, pressed);
-                    // Brief visual confirmation in status bar on key-down
-                    if (pressed)
-                        DispatcherQueue.TryEnqueue(() =>
-                            page.ShowKeyIndicator(key.ToString()));
-                }
             }
         });
     }

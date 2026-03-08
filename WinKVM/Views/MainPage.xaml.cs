@@ -23,6 +23,8 @@ public sealed partial class MainPage : Page
     {
         InitializeComponent();
 
+        SharpnessSlider.Value = 60; // default CAS sharpness
+
         LoginPage.SetProfileStore(_profileStore);
         LoginPage.ConnectRequested += (host, port, user, pass) =>
             _session.Connect(host, port, user, pass);

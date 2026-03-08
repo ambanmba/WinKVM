@@ -26,7 +26,6 @@ public sealed class SrPipeline : IDisposable
     private bool                  _ready;
     private bool                  _disposed;
 
-    /// Model input/output names (vary by model — inspect with Netron).
     private string _inputName  = "input";
     private string _outputName = "output";
 
@@ -48,16 +47,12 @@ public sealed class SrPipeline : IDisposable
             var device = new LearningModelDevice(LearningModelDeviceKind.DirectXHighPerformance);
             _session   = new LearningModelSession(_model, device);
 
-            // Infer input/output names from first/last descriptors
             if (_model.InputFeatures.Count > 0)
                 _inputName  = _model.InputFeatures[0].Name;
             if (_model.OutputFeatures.Count > 0)
                 _outputName = _model.OutputFeatures[0].Name;
 
             _ready = true;
-            System.Diagnostics.Debug.WriteLine(
-                $"[SrPipeline] Model loaded: {_model.Name}  " +
-                $"device=DirectXHighPerformance  in={_inputName}  out={_outputName}");
             return true;
         }
         catch (Exception ex)
@@ -74,12 +69,11 @@ public sealed class SrPipeline : IDisposable
         if (!IsAvailable || _session is null) return null;
         try
         {
-            // Wrap input bytes as SoftwareBitmap (BGRA8 → model expects NCHW float)
             using var bitmap = SoftwareBitmap.CreateCopyFromBuffer(
                 bgra.AsBuffer(), BitmapPixelFormat.Bgra8, width, height);
 
             var binding = new LearningModelBinding(_session);
-            binding.Bind(_inputName,  ImageFeatureValue.CreateFromVideoFrame(
+            binding.Bind(_inputName, ImageFeatureValue.CreateFromVideoFrame(
                 VideoFrame.CreateWithSoftwareBitmap(bitmap)));
 
             var result = await _session.EvaluateAsync(binding, Guid.NewGuid().ToString());
@@ -87,7 +81,6 @@ public sealed class SrPipeline : IDisposable
             var outputImage = result.Outputs[_outputName] as ImageFeatureValue;
             if (outputImage?.VideoFrame.SoftwareBitmap is not { } outBitmap) return null;
 
-            // Convert result to BGRA byte array
             using var converted = SoftwareBitmap.Convert(outBitmap, BitmapPixelFormat.Bgra8);
             int outSize = converted.PixelWidth * converted.PixelHeight * 4;
             var outBytes = new byte[outSize];

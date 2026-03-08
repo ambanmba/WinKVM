@@ -25,7 +25,7 @@
                 <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
                     <TextBlock Text="Sharp" VerticalAlignment="Center" FontSize="11"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
-                    <Slider x:Name="SharpnessSlider" Width="80" Minimum="0" Maximum="100" Value="60"
+                    <Slider x:Name="SharpnessSlider" Width="80" Minimum="0" Maximum="100"
                             VerticalAlignment="Center" ValueChanged="SharpnessSlider_ValueChanged"/>
                 </StackPanel>
             </AppBarElementContainer>

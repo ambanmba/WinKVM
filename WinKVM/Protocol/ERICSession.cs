@@ -924,11 +924,16 @@ public sealed class ERICSession : INotifyPropertyChanged
         // new connection after reconnect, which would corrupt the handshake.
         var conn = _conn;
         if (conn is null) return;
+
+        // Wire format (4 bytes — matches SwiftKVM / Raritan Java client):
+        //   msgType(1) + pad(1) + keyWithFlag(2)
+        // The pressed state is packed into bit 15 of the 16-bit key field.
+        // keyCode uses bits 0-14 (AT scan code - 1, range 0-127).
+        ushort keyWithFlag = (ushort)((keyCode & 0x7FFF) | (pressed ? 0x8000 : 0));
         var msg = new BinaryWriter2();
         msg.WriteU8((byte)ClientMessage.KeyEvent);
-        msg.WriteU8(pressed ? (byte)1 : (byte)0);
-        msg.WriteU16(0); // padding
-        msg.WriteU32(keyCode);
+        msg.WriteU8(0x00); // padding
+        msg.WriteU16(keyWithFlag);
         try { await conn.WriteAsync(msg.ToArray(), ct); } catch { /* ignore if conn closed */ }
     }
 

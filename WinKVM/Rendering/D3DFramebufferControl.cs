@@ -71,30 +71,15 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         Unloaded += (_, _) => Dispose();
     }
 
-    private static readonly string _d3dLog = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winkvm_d3d.log");
-
     private void Initialize()
     {
-        try
-        {
-            var featureLevels = new[] { FeatureLevel.Level_11_0 };
-            D3D11.D3D11CreateDevice(
-                null, DriverType.Hardware, DeviceCreationFlags.BgraSupport, featureLevels,
-                out _device, out _ctx);
-            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] D3D11 device ok\n");
-            CreateSwapChain();
-            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] SwapChain ok\n");
-            CompileShaders();
-            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] Shaders ok\n");
-            CreateSamplers();
-            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] Init complete\n");
-        }
-        catch (Exception ex)
-        {
-            System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] Init FAILED: {ex}\n");
-            throw;
-        }
+        var featureLevels = new[] { FeatureLevel.Level_11_0 };
+        D3D11.D3D11CreateDevice(
+            null, DriverType.Hardware, DeviceCreationFlags.BgraSupport, featureLevels,
+            out _device, out _ctx);
+        CreateSwapChain();
+        CompileShaders();
+        CreateSamplers();
     }
 
     private void CreateSwapChain()

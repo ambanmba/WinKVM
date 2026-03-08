@@ -41,36 +41,21 @@ internal sealed class HwndKeyboardHook : IDisposable
     private readonly LLHookProc _proc; // keep alive to prevent GC
     private readonly Action<uint, bool> _onKey;
 
-    private static readonly string _log = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winkvm_kbd.log");
-    private int _logCount;
-
     public HwndKeyboardHook(nint mainHwnd, Action<uint, bool> onKey)
     {
-        _mainHwnd = mainHwnd;
-        _onKey    = onKey;
-        _proc     = LLProc;
+        _mainHwnd   = mainHwnd;
+        _onKey      = onKey;
+        _proc       = LLProc;
         _hookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(null), 0);
-        File.AppendAllText(_log,
-            $"[{DateTime.Now:HH:mm:ss}] LL hook installed={_hookHandle != 0} hwnd=0x{mainHwnd:X}\n");
     }
 
     private nint LLProc(int nCode, nint wParam, nint lParam)
     {
         if (nCode >= 0 && GetForegroundWindow() == _mainHwnd)
         {
-            if (wParam is WM_KEYDOWN or WM_SYSKEYDOWN)
-            {
-                var kbs = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-                if (_logCount++ < 10)
-                    File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] LL KEYDOWN vk=0x{kbs.vkCode:X}\n");
-                _onKey(kbs.vkCode, true);
-            }
-            else if (wParam is WM_KEYUP or WM_SYSKEYUP)
-            {
-                var kbs = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-                _onKey(kbs.vkCode, false);
-            }
+            var kbs = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+            if (wParam is WM_KEYDOWN or WM_SYSKEYDOWN) _onKey(kbs.vkCode, true);
+            else if (wParam is WM_KEYUP   or WM_SYSKEYUP)  _onKey(kbs.vkCode, false);
         }
         return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
     }

@@ -25,14 +25,20 @@ public sealed partial class MainPage : Page
         LoginPage.ConnectRequested += (host, port, user, pass) =>
             _session.Connect(host, port, user, pass);
 
+        SendTextFlyout.Session = _session;
+
         _session.StateChanged += OnSessionStateChanged;
         _session.CertificateChallenge += OnCertificateChallenge;
 
         KvmRenderer.IsTabStop = true;
-        KvmRenderer.Focus(FocusState.Programmatic);
 
         // Wire up renderer
         _session.Renderer = KvmRenderer;
+
+        // Handle keyboard at Page level so all keys reach the KVM
+        // (WinUI 3 may consume some keys before reaching child Grid controls)
+        KeyDown += Page_KeyDown;
+        KeyUp   += Page_KeyUp;
     }
 
     // ── Session state ─────────────────────────────────────────────────────────
@@ -101,9 +107,13 @@ public sealed partial class MainPage : Page
     private void CtrlAltDelBtn_Click  (object s, RoutedEventArgs e) => _session.SendCtrlAltDel();
     private void ReconnectBtn_Click   (object s, RoutedEventArgs e) => _session.Reconnect();
     private void BackToLoginBtn_Click (object s, RoutedEventArgs e) => _session.Disconnect();
-    private void DiagnosticsBtn_Click (object s, RoutedEventArgs e) { /* TODO: diagnostics flyout */ }
-    private void SettingsBtn_Click    (object s, RoutedEventArgs e) { /* TODO: settings page */ }
-    private void SendTextBtn_Click    (object s, RoutedEventArgs e) { /* TODO: send text flyout */ }
+    private void DiagnosticsBtn_Click (object s, RoutedEventArgs e) { /* TODO */ }
+    private void SettingsBtn_Click    (object s, RoutedEventArgs e) { /* TODO */ }
+    private void SendTextBtn_Click    (object s, RoutedEventArgs e)
+    {
+        SendTextFlyout.Visibility = SendTextFlyout.Visibility == Visibility.Visible
+            ? Visibility.Collapsed : Visibility.Visible;
+    }
     private void AIAgentBtn_Click     (object s, RoutedEventArgs e)
     {
         AiPanel.Visibility = AiPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
@@ -141,8 +151,9 @@ public sealed partial class MainPage : Page
     }
 
     // ── Keyboard input ────────────────────────────────────────────────────────
+    // Page-level handlers ensure all keys reach the KVM regardless of focus.
 
-    private void KvmRenderer_KeyDown(object sender, KeyRoutedEventArgs e)
+    private void Page_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
         if (KeyboardHandler.RaritanKeyCode(e.Key) is { } code)
@@ -152,7 +163,7 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void KvmRenderer_KeyUp(object sender, KeyRoutedEventArgs e)
+    private void Page_KeyUp(object sender, KeyRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
         if (KeyboardHandler.RaritanKeyCode(e.Key) is { } code)
@@ -162,18 +173,22 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private void KvmRenderer_KeyDown(object sender, KeyRoutedEventArgs e) => Page_KeyDown(sender, e);
+    private void KvmRenderer_KeyUp  (object sender, KeyRoutedEventArgs e) => Page_KeyUp  (sender, e);
+
     // ── Mouse input ───────────────────────────────────────────────────────────
 
     private void KvmRenderer_PointerMoved(object sender, PointerRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
-        SendMouseEvent(e, dragButton: 0);
+        SendMouseEvent(e); // reads current button state — preserves button during drag
     }
 
     private void KvmRenderer_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
         KvmRenderer.CapturePointer(e.Pointer);
+        KvmRenderer.Focus(FocusState.Pointer); // reclaim keyboard focus on click
         SendMouseEvent(e);
     }
 

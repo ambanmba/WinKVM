@@ -1,39 +1,26 @@
-## .NET / C#
+# Build output
 bin/
 obj/
 *.user
 *.suo
 .vs/
-packages/
+
+# NuGet
 *.nupkg
-*.snupkg
+packages/
 
-## Visual Studio
-.vscode/
-*.DotSettings.user
-TestResults/
+# Desktop logs and debug scripts
+winkvm_proto.log
+winkvm_d3d.log
+winkvm_run.log
+winkvm_run.log.*
+check_dlls.ps1
+check_events.ps1
+run_and_log.ps1
 
-## WinUI / MSIX packaging
-AppPackages/
-BundleArtifacts/
-*.msixupload
+# Claude session memory
+.claude/
 
-## Build outputs
-[Dd]ebug/
-[Rr]elease/
-x64/
-x86/
-ARM64/
-[Aa][Rr][Mm]64/
-bld/
-[Bb]in/
-[Oo]bj/
-
-## Secrets
-*.pfx
-*.p12
-appsettings.Local.json
-
-## OS
-.DS_Store
+# OS
 Thumbs.db
+.DS_Store

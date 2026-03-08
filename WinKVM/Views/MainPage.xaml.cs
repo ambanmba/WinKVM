@@ -30,15 +30,15 @@ public sealed partial class MainPage : Page
         _session.StateChanged += OnSessionStateChanged;
         _session.CertificateChallenge += OnCertificateChallenge;
 
-        KvmRenderer.IsTabStop = true;
-
         // Wire up renderer
         _session.Renderer = KvmRenderer;
 
-        // Handle keyboard at Page level so all keys reach the KVM
-        // (WinUI 3 may consume some keys before reaching child Grid controls)
-        KeyDown += Page_KeyDown;
-        KeyUp   += Page_KeyUp;
+        // Wire keyboard proxy using AddHandler(handledEventsToo:true) so TextBox
+        // internal key handling (backspace, etc.) doesn't swallow our events.
+        KeyboardProxy.AddHandler(KeyDownEvent, new KeyEventHandler(KvmRenderer_KeyDown), handledEventsToo: true);
+        KeyboardProxy.AddHandler(KeyUpEvent,   new KeyEventHandler(KvmRenderer_KeyUp),   handledEventsToo: true);
+        // Clear any character the TextBox might accept before we handle it
+        KeyboardProxy.TextChanging += (tb, _) => { if (tb.Text.Length > 0) tb.Text = ""; };
     }
 
     // ── Session state ─────────────────────────────────────────────────────────
@@ -69,7 +69,10 @@ public sealed partial class MainPage : Page
             {
                 ConnectingText.Text = "";
                 InitAgentLoop();
-                KvmRenderer.Focus(FocusState.Programmatic);
+                // Delay focus until after the layout pass so KeyboardProxy is visible
+                DispatcherQueue.TryEnqueue(
+                    Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
+                    () => KeyboardProxy.Focus(FocusState.Programmatic));
             }
             else if (state == SessionState.Disconnected || state is SessionState)
             {
@@ -153,7 +156,7 @@ public sealed partial class MainPage : Page
     // ── Keyboard input ────────────────────────────────────────────────────────
     // Page-level handlers ensure all keys reach the KVM regardless of focus.
 
-    private void Page_KeyDown(object sender, KeyRoutedEventArgs e)
+    private void KvmRenderer_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
         if (KeyboardHandler.RaritanKeyCode(e.Key) is { } code)
@@ -163,7 +166,7 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void Page_KeyUp(object sender, KeyRoutedEventArgs e)
+    private void KvmRenderer_KeyUp(object sender, KeyRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
         if (KeyboardHandler.RaritanKeyCode(e.Key) is { } code)
@@ -172,9 +175,6 @@ public sealed partial class MainPage : Page
             e.Handled = true;
         }
     }
-
-    private void KvmRenderer_KeyDown(object sender, KeyRoutedEventArgs e) => Page_KeyDown(sender, e);
-    private void KvmRenderer_KeyUp  (object sender, KeyRoutedEventArgs e) => Page_KeyUp  (sender, e);
 
     // ── Mouse input ───────────────────────────────────────────────────────────
 
@@ -188,7 +188,7 @@ public sealed partial class MainPage : Page
     {
         if (_session.State != SessionState.Connected) return;
         KvmRenderer.CapturePointer(e.Pointer);
-        KvmRenderer.Focus(FocusState.Pointer); // reclaim keyboard focus on click
+        KeyboardProxy.Focus(FocusState.Pointer); // reclaim keyboard focus on click
         SendMouseEvent(e);
     }
 

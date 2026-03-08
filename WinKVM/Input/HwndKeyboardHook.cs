@@ -51,12 +51,16 @@ internal sealed class HwndKeyboardHook : IDisposable
 
     private nint LLProc(int nCode, nint wParam, nint lParam)
     {
-        if (nCode >= 0 && GetForegroundWindow() == _mainHwnd)
+        try
         {
-            var kbs = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-            if (wParam is WM_KEYDOWN or WM_SYSKEYDOWN) _onKey(kbs.vkCode, true);
-            else if (wParam is WM_KEYUP or WM_SYSKEYUP) _onKey(kbs.vkCode, false);
+            if (nCode >= 0 && GetForegroundWindow() == _mainHwnd)
+            {
+                var kbs = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                if (wParam is WM_KEYDOWN or WM_SYSKEYDOWN) _onKey(kbs.vkCode, true);
+                else if (wParam is WM_KEYUP or WM_SYSKEYUP) _onKey(kbs.vkCode, false);
+            }
         }
+        catch { /* never let exceptions escape a native callback — would crash the process */ }
         return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
     }
 

@@ -28,12 +28,16 @@ public sealed partial class MainWindow : Window
         var page = (Views.MainPage)((Microsoft.UI.Xaml.Controls.Grid)Content).Children[0];
         _keyboardHook = new HwndKeyboardHook(hwnd, (vk, pressed) =>
         {
-            if (page.Session.State == Protocol.SessionState.Connected)
+            try
             {
-                var key = (Windows.System.VirtualKey)vk;
-                if (Input.KeyboardHandler.RaritanKeyCode(key) is { } code)
-                    _ = page.Session.SendKeyEventAsync(code, pressed);
+                if (page.Session.State == Protocol.SessionState.Connected)
+                {
+                    var key = (Windows.System.VirtualKey)vk;
+                    if (Input.KeyboardHandler.RaritanKeyCode(key) is { } code)
+                        _ = page.Session.SendKeyEventAsync(code, pressed);
+                }
             }
+            catch { /* ignore — must not throw from native callback */ }
         });
     }
 

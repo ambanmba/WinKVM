@@ -222,18 +222,25 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _displayRTV = _device.CreateRenderTargetView(_displayTex);
         _displayUAV = _device.CreateUnorderedAccessView(_displayTex);
 
-        // CAS output texture (same format — CAS reads _displayTex, writes here)
-        _casOutTex?.Dispose(); _casOutSRV?.Dispose(); _casOutUAV?.Dispose();
-        _casOutTex = _device.CreateTexture2D(desc);
-        _casOutSRV = _device.CreateShaderResourceView(_casOutTex);
-        _casOutUAV = _device.CreateUnorderedAccessView(_casOutTex);
-
-        // CAS constants buffer: float2 texSize + float sharpness + float pad = 16 bytes
-        // Dynamic + WriteDiscard allows per-frame sharpness updates without a staging copy.
-        _casCB?.Dispose();
-        _casCB = _device.CreateBuffer(new float[] { w, h, Sharpness, 0f }.AsSpan(),
-            new BufferDescription { ByteWidth = 16u, Usage = ResourceUsage.Dynamic,
-                BindFlags = BindFlags.ConstantBuffer, CPUAccessFlags = CpuAccessFlags.Write });
+        // CAS output texture + constant buffer (optional — failure disables CAS gracefully)
+        try
+        {
+            _casOutTex?.Dispose(); _casOutSRV?.Dispose(); _casOutUAV?.Dispose(); _casCB?.Dispose();
+            _casOutTex = _device.CreateTexture2D(desc);
+            _casOutSRV = _device.CreateShaderResourceView(_casOutTex);
+            _casOutUAV = _device.CreateUnorderedAccessView(_casOutTex);
+            // Dynamic constant buffer: float2 texSize + float sharpness + float pad
+            _casCB = _device.CreateBuffer(new BufferDescription
+            {
+                ByteWidth = 16u, Usage = ResourceUsage.Dynamic,
+                BindFlags = BindFlags.ConstantBuffer, CPUAccessFlags = CpuAccessFlags.Write,
+            });
+        }
+        catch
+        {
+            // CAS resource creation failed — sharpening will be skipped in Render()
+            _casOutTex = null; _casOutSRV = null; _casOutUAV = null; _casCB = null;
+        }
 
         _displayW = w; _displayH = h;
     }

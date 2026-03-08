@@ -151,46 +151,60 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     private async Task PerformConnectionAsync(CancellationToken ct)
     {
-        var stage = "connecting";
-        try
+        // Retry loop: auto-reconnect on server-initiated disconnect.
+        // Gives up after an auth failure or user cancel.
+        while (!ct.IsCancellationRequested)
         {
-            _conn = new ERICConnection();
-            await _conn.ConnectAsync(_host!, _port,
-                CertificateChallenge is null ? null : (fp, msg) => CertificateChallenge.Invoke(fp, msg), ct);
+            var stage = "connecting";
+            bool authFailed = false;
+            try
+            {
+                _conn = new ERICConnection();
+                await _conn.ConnectAsync(_host!, _port,
+                    CertificateChallenge is null ? null : (fp, msg) => CertificateChallenge.Invoke(fp, msg), ct);
 
-            // e-RIC hello: client sends "e-RIC AUTH=" to identify itself (server waits for this)
-            stage = "hello";
-            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] TLS connected, sending hello\n");
-            await _conn.WriteAsync(System.Text.Encoding.ASCII.GetBytes("e-RIC AUTH="), ct);
+                stage = "hello";
+                System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] TLS connected, sending hello\n");
+                await _conn.WriteAsync(System.Text.Encoding.ASCII.GetBytes("e-RIC AUTH="), ct);
 
-            // Version handshake: server responds with "e-RIC RFB XX.XX\n" (16 bytes)
-            stage = "version handshake";
-            var ver = await _conn.ReadAsync(16, ct);
-            var verStr = System.Text.Encoding.ASCII.GetString(ver);
-            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] Ver: '{verStr.Replace("\n","\\n")}'\n");
-            // Echo back the same version string
-            await _conn.WriteAsync(ver, ct);
+                stage = "version handshake";
+                var ver = await _conn.ReadAsync(16, ct);
+                var verStr = System.Text.Encoding.ASCII.GetString(ver);
+                System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] Ver: '{verStr.Replace("\n","\\n")}'\n");
+                await _conn.WriteAsync(ver, ct);
 
-            State = SessionState.Authenticating;
-            StatusMessage = $"Version: {verStr.TrimEnd()}";
+                State = SessionState.Authenticating;
+                StatusMessage = $"Version: {verStr.TrimEnd()}";
+                _selectedAuthMethod = 0;
+                _authSuccessful = false;
 
-            _selectedAuthMethod = 0;
-            _authSuccessful = false;
+                await MessageLoopAsync(ct);
+                return; // clean exit (e.g. Disconnect() called)
+            }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex) when (ex.Message.Contains("Authentication failed"))
+            {
+                System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] FAILED at [{stage}]: {ex}\n");
+                State = SessionState.Disconnected;
+                StatusMessage = $"Connection error: {FriendlyError(ex)}";
+                authFailed = true;
+            }
+            catch (Exception ex)
+            {
+                System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] FAILED at [{stage}]: {ex}\n");
+                // Server-initiated disconnect — reconnect after a short delay
+                State = SessionState.Connecting;
+                StatusMessage = "Reconnecting...";
+            }
+            finally
+            {
+                ReleaseResources();
+            }
 
-            // Single unified message loop handles auth + init + runtime (mirrors Swift)
-            await MessageLoopAsync(ct);
-        }
-        catch (OperationCanceledException) { /* normal disconnect */ }
-        catch (Exception ex)
-        {
-            var msg = $"[{stage}] {FriendlyError(ex)}";
-            System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] FAILED at [{stage}]: {ex}\n");
-            State = SessionState.Disconnected;
-            StatusMessage = msg;
-        }
-        finally
-        {
-            ReleaseResources();
+            if (authFailed) return;
+
+            // Wait before reconnecting
+            try { await Task.Delay(2000, ct); } catch (OperationCanceledException) { return; }
         }
     }
 
@@ -295,7 +309,8 @@ public sealed class ERICSession : INotifyPropertyChanged
                         await SendFramebufferUpdateRequestAsync(0, 0, fbW, fbH, incremental: false, ct);
                         State = SessionState.Connected;
                         StatusMessage = $"Connected ({fbW}x{fbH})";
-                        _ = PingLoopAsync(ct); // keepalive: ping every 10 s
+                        _ = PingLoopAsync(ct);           // keepalive: ping every 10 s
+                        _ = PointerKeepaliveAsync(ct);   // keepalive: null pointer every 1 s (prevents KVM inactivity timeout)
                     }
                     else
                     {
@@ -665,6 +680,24 @@ public sealed class ERICSession : INotifyPropertyChanged
         reply.WriteU8((byte)ClientMessage.PingReply);
         reply.WriteBytes(data); // echo all 7 bytes back
         await _conn.WriteAsync(reply.ToArray(), ct);
+    }
+
+    /// Pointer keepalive: send a null pointer event every 1 s to prevent the KVM's
+    /// server-side inactivity timeout from closing the session when the user isn't
+    /// actively moving the mouse over the KVM view.
+    private async Task PointerKeepaliveAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(1000, ct);
+                if (_conn is not null)
+                    await SendPointerEventAsync(0, 0, 0, ct: ct);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch { /* connection gone */ }
     }
 
     /// Proactive keepalive: send PingRequest every 10 s (matching SwiftKVM ERICPing).

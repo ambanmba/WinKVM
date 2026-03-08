@@ -17,6 +17,7 @@ public sealed partial class MainPage : Page
     public  ERICSession           Session      => _session;
     private readonly ProfileStore _profileStore = new();
     private AgentLoop? _agentLoop;
+    private DispatcherTimer? _fpsTimer;
 
     public MainPage()
     {
@@ -65,12 +66,22 @@ public sealed partial class MainPage : Page
             {
                 ConnectingText.Text = "";
                 InitAgentLoop();
+                FpsText.Visibility = Visibility.Visible;
+                _fpsTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+                _fpsTimer.Tick += (_, _) =>
+                {
+                    FpsText.Text = $"{_session.CurrentFps:F0}/{_session.AvgFps:F0} fps";
+                };
+                _fpsTimer.Start();
             }
             else if (state == SessionState.Disconnected || state is SessionState)
             {
                 _agentLoop?.Stop();
                 _agentLoop = null;
                 AiPanel.Visibility = Visibility.Collapsed;
+                _fpsTimer?.Stop();
+                _fpsTimer = null;
+                FpsText.Visibility = Visibility.Collapsed;
             }
         });
     }

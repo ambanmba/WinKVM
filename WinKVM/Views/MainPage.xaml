@@ -25,9 +25,14 @@
                 <AppBarButton Label="Settings" Click="SettingsBtn_Click"/>
             </CommandBar.SecondaryCommands>
             <CommandBar.Content>
-                <TextBlock x:Name="StatusText" VerticalAlignment="Center" Margin="8,0"
-                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                           FontSize="12"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Spacing="12">
+                    <TextBlock x:Name="StatusText" VerticalAlignment="Center" Margin="8,0,0,0"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               FontSize="12"/>
+                    <TextBlock x:Name="FpsText" VerticalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               FontSize="12" FontFamily="Consolas" Visibility="Collapsed"/>
+                </StackPanel>
             </CommandBar.Content>
         </CommandBar>
 

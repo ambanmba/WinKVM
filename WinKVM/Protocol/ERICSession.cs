@@ -67,6 +67,9 @@ public sealed class ERICSession : INotifyPropertyChanged
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
 
+    // Last pointer position — keepalive sends to this position so it doesn't move the cursor
+    private ushort _lastPtrX, _lastPtrY;
+
     // Decoders
     private readonly HextileDecoder _hextileDecoder = new();
     private readonly ICTDecoder     _ictDecoder     = new();
@@ -693,7 +696,7 @@ public sealed class ERICSession : INotifyPropertyChanged
             {
                 await Task.Delay(1000, ct);
                 if (_conn is not null)
-                    await SendPointerEventAsync(0, 0, 0, ct: ct);
+                    await SendPointerEventAsync(_lastPtrX, _lastPtrY, 0, ct: ct);
             }
         }
         catch (OperationCanceledException) { }
@@ -926,6 +929,7 @@ public sealed class ERICSession : INotifyPropertyChanged
     // The z field is 0 for moves/clicks; non-zero for scroll wheel.
     public async Task SendPointerEventAsync(ushort x, ushort y, byte buttonMask, short z = 0, CancellationToken ct = default)
     {
+        _lastPtrX = x; _lastPtrY = y;
         var msg = new BinaryWriter2();
         msg.WriteU8((byte)ClientMessage.PointerEvent);
         msg.WriteU8(buttonMask);

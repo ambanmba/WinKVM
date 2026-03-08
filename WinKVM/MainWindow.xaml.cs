@@ -26,14 +26,24 @@ public sealed partial class MainWindow : Window
         Activated -= OnFirstActivated;
         var hwnd = WindowNative.GetWindowHandle(this);
         var page = (Views.MainPage)((Microsoft.UI.Xaml.Controls.Grid)Content).Children[0];
+        var kbdLog = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winkvm_kbd.log");
+        int kbdLogCount = 0;
         _keyboardHook = new HwndKeyboardHook(hwnd, (vk, pressed) =>
         {
             if (page.Session.State == Protocol.SessionState.Connected)
             {
                 var key = (Windows.System.VirtualKey)vk;
                 if (Input.KeyboardHandler.RaritanKeyCode(key) is { } code)
+                {
+                    if (kbdLogCount++ < 5)
+                        File.AppendAllText(kbdLog, $"[{DateTime.Now:HH:mm:ss}] SEND vk=0x{vk:X} code={code} pressed={pressed}\n");
                     _ = page.Session.SendKeyEventAsync(code, pressed);
+                }
+                else if (kbdLogCount++ < 5)
+                    File.AppendAllText(kbdLog, $"[{DateTime.Now:HH:mm:ss}] NO_MAP vk=0x{vk:X} pressed={pressed}\n");
             }
+            else if (kbdLogCount++ < 3)
+                File.AppendAllText(kbdLog, $"[{DateTime.Now:HH:mm:ss}] NOT_CONNECTED vk=0x{vk:X} state={page.Session.State}\n");
         });
     }
 

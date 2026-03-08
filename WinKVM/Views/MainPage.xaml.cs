@@ -114,23 +114,38 @@ public sealed partial class MainPage : Page
         AiPanel.Visibility = AiPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
     }
 
-    private void ScreenshotBtn_Click(object s, RoutedEventArgs e)
+    private async void ScreenshotBtn_Click(object s, RoutedEventArgs e)
     {
-        var png = KvmRenderer.CaptureScreenshot();
-        if (png is null) return;
-        var ts   = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-        var path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
-            "WinKVM", $"WinKVM_{ts}.png");
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllBytes(path, png);
+        try
+        {
+            // CaptureScreenshot uses D3D11 — run on thread pool to avoid UI contention
+            var png = await Task.Run(() => KvmRenderer.CaptureScreenshot());
+            if (png is null) return;
+            var ts   = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                "WinKVM", $"WinKVM_{ts}.png");
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllBytesAsync(path, png);
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Screenshot failed: {ex.Message}";
+        }
     }
 
     private async void PasteBtn_Click(object s, RoutedEventArgs e)
     {
-        var text = await GetClipboardTextAsync();
-        if (!string.IsNullOrEmpty(text))
-            await _session.SendTextAsync(text);
+        try
+        {
+            var text = await GetClipboardTextAsync();
+            if (!string.IsNullOrEmpty(text))
+                await _session.SendTextAsync(text);
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Paste failed: {ex.Message}";
+        }
     }
 
     private static async Task<string?> GetClipboardTextAsync()

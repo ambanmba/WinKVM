@@ -23,6 +23,7 @@ public sealed class SrPipeline : IDisposable
     private bool                  _ready;
     private bool                  _disposed;
     private bool                  _busy;   // re-entrancy guard
+    private int                   _inferCount;
 
     // Cached read-back and write-back staging textures (avoid per-frame alloc)
     private ID3D11Texture2D? _stagingRead;
@@ -46,30 +47,39 @@ public sealed class SrPipeline : IDisposable
 
     /// Initialise: build the ONNX model in-memory, load it into WinML,
     /// and route to the Hexagon NPU via DirectXMinPower.
+    private static readonly string _log = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winkvm_npu.log");
+
     public async Task<bool> InitAsync()
     {
+        File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] InitAsync started\n");
         try
         {
             var onnxBytes = OnnxBuilder.BuildDepthwiseSharpen(3, 0.25f);
+            File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] ONNX built: {onnxBytes.Length} bytes\n");
 
-            using var ms  = new MemoryStream(onnxBytes);
-            using var ras = ms.AsRandomAccessStream();
-            // LearningModel.LoadFromStreamAsync takes IRandomAccessStreamReference
-            var streamRef = RandomAccessStreamReference.CreateFromStream(ras);
-            _model = await LearningModel.LoadFromStreamAsync(streamRef);
+            // Write to temp file — LoadFromStreamAsync requires a clonable stream
+            // which MemoryStream doesn't support; StorageFile path is reliable.
+            var tempPath = Path.Combine(Path.GetTempPath(), $"winkvm_sr_{Guid.NewGuid():N}.onnx");
+            await File.WriteAllBytesAsync(tempPath, onnxBytes);
+            try
+            {
+                var file = await Windows.Storage.StorageFile.GetFileFromPathAsync(tempPath);
+                _model = await LearningModel.LoadFromStorageFileAsync(file);
+            }
+            finally { try { File.Delete(tempPath); } catch { } }
+            File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] Model loaded: {_model.Name}\n");
 
-            // DirectXMinPower → Hexagon NPU on Snapdragon X / Copilot+ PCs.
-            // Falls back to Adreno GPU on non-NPU hardware — still accelerated.
             var device = new LearningModelDevice(LearningModelDeviceKind.DirectXMinPower);
             _session = new LearningModelSession(_model, device);
+            File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] Session created (DirectXMinPower)\n");
 
             _ready = true;
-            System.Diagnostics.Debug.WriteLine("[SrPipeline] NPU session ready");
             return true;
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[SrPipeline] Init failed: {ex.Message}");
+            File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] Init FAILED: {ex.GetType().Name}: {ex.Message}\n");
             return false;
         }
     }

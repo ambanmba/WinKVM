@@ -56,9 +56,10 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
     // ── NPU sharpening (Windows.AI.MachineLearning → Hexagon NPU) ────────────
     private SrPipeline? _srPipeline;
     private volatile bool _npuBusy;
+    private int _npuLogCount;
 
     /// When true: NPU (WinML) sharpening; when false: GPU (CAS) sharpening.
-    private bool _npuEnabled;
+    private volatile bool _npuEnabled; // volatile: set on UI thread, read on render thread
     public bool NpuSharpenEnabled
     {
         get => _npuEnabled;
@@ -125,6 +126,8 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
             System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] Shaders ok\n");
             CreateSamplers();
             System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] Init complete\n");
+            if (_npuEnabled && _srPipeline is null)
+                InitNpuAsync(); // re-create NPU pipeline after reconnect/Dispose
         }
         catch (Exception ex)
         {
@@ -447,10 +450,6 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
 
         // Unbind display texture from any lingering RTV before using it as SRV
         _ctx.OMSetRenderTargets((ID3D11RenderTargetView?)null);
-
-        // ── NPU sharpening pass (Hexagon NPU via WinML) ───────────────────────
-        // Triggered when NpuSharpenEnabled=true and pipeline is ready.
-        // Modifies _displayTex in-place; one-frame latency is acceptable for KVM.
         if (_npuEnabled && _srPipeline is { IsAvailable: true } sr && !_npuBusy)
         {
             _npuBusy = true;
@@ -557,7 +556,7 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _fillCmdSRV?.Dispose(); _fillCmdBuf?.Dispose();
         _displayUAV?.Dispose(); _displayRTV?.Dispose();
         _displaySRV?.Dispose(); _displayTex?.Dispose();
-        _srPipeline?.Dispose();
+        _srPipeline?.Dispose(); _srPipeline = null;
         _casCB?.Dispose(); _casOutUAV?.Dispose(); _casOutSRV?.Dispose(); _casOutTex?.Dispose();
         _noCullRS?.Dispose(); _linearSampler?.Dispose();
         _ictCS?.Dispose(); _fillCS?.Dispose(); _casCS?.Dispose();

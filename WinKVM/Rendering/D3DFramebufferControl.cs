@@ -74,7 +74,8 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
     private void InitNpuAsync()
     {
         _srPipeline = new SrPipeline();
-        _ = _srPipeline.InitAsync();  // fire-and-forget; IsAvailable gates usage
+        _ = _srPipeline.InitAsync(_displayW > 0 ? _displayW : 2560,
+                                  _displayH > 0 ? _displayH : 1440);
     }
 
     // Display texture (BGRA8, persistent)

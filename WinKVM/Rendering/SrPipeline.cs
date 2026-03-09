@@ -50,29 +50,41 @@ public sealed class SrPipeline : IDisposable
     private static readonly string _log = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winkvm_npu.log");
 
-    public async Task<bool> InitAsync()
+    public async Task<bool> InitAsync(int width = 2560, int height = 1440)
     {
-        File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] InitAsync started\n");
+        File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] InitAsync started {width}x{height}\n");
         try
         {
-            var onnxBytes = OnnxBuilder.BuildDepthwiseSharpen(3, 0.25f);
+            var onnxBytes = OnnxBuilder.BuildDepthwiseSharpen(3, 0.25f, width, height);
             File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] ONNX built: {onnxBytes.Length} bytes\n");
+            File.AppendAllText(_log, $"HEX: {BitConverter.ToString(onnxBytes)}\n");
 
-            // Write to temp file — LoadFromStreamAsync requires a clonable stream
-            // which MemoryStream doesn't support; StorageFile path is reliable.
-            var tempPath = Path.Combine(Path.GetTempPath(), $"winkvm_sr_{Guid.NewGuid():N}.onnx");
-            await File.WriteAllBytesAsync(tempPath, onnxBytes);
-            try
-            {
-                var file = await Windows.Storage.StorageFile.GetFileFromPathAsync(tempPath);
-                _model = await LearningModel.LoadFromStorageFileAsync(file);
-            }
-            finally { try { File.Delete(tempPath); } catch { } }
+            // Write model to a fixed path alongside the app — WinML session creation
+            // re-accesses the file for device-specific compilation/caching, so the
+            // file must stay on disk for the session's lifetime.
+            var modelPath = Path.Combine(AppContext.BaseDirectory, "winkvm_sr.onnx");
+            await File.WriteAllBytesAsync(modelPath, onnxBytes);
+            var file = await Windows.Storage.StorageFile.GetFileFromPathAsync(modelPath);
+            _model = await LearningModel.LoadFromStorageFileAsync(file);
             File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] Model loaded: {_model.Name}\n");
 
-            var device = new LearningModelDevice(LearningModelDeviceKind.DirectXMinPower);
-            _session = new LearningModelSession(_model, device);
-            File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] Session created (DirectXMinPower)\n");
+            // Try devices in priority order: NPU first, GPU fallbacks, then CPU
+            LearningModelSession? sess = null;
+            foreach (var kind in new[] {
+                LearningModelDeviceKind.DirectXMinPower,
+                LearningModelDeviceKind.DirectXHighPerformance,
+                LearningModelDeviceKind.DirectX,
+                LearningModelDeviceKind.Cpu })
+            {
+                try {
+                    sess = new LearningModelSession(_model, new LearningModelDevice(kind));
+                    File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] Session on {kind}\n");
+                    break;
+                } catch (Exception ex2) {
+                    File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] {kind} failed: {ex2.Message.Split('\n')[0]}\n");
+                }
+            }
+            _session = sess ?? throw new Exception("All devices failed");
 
             _ready = true;
             return true;

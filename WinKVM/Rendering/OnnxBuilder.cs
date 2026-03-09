@@ -45,8 +45,16 @@ internal static class OnnxBuilder
     private static void WriteStringField(List<byte> buf, int field, string s)
         => WriteBytesField(buf, field, System.Text.Encoding.UTF8.GetBytes(s));
 
-    // ── ONNX requires NON-packed repeated int64 (packed=false in onnx.proto) ──
-    // Write each element individually with its own field tag (wire type 0).
+    // Write packed repeated int64 (wire type 2, length-delimited blob of varints).
+    // proto3 defaults to packed for repeated numeric fields; WinML expects this.
+    private static void WritePackedInt64s(List<byte> buf, int field, params long[] vals)
+    {
+        var data = new List<byte>();
+        foreach (var v in vals) WriteVarintRaw(data, (ulong)v);
+        WriteBytesField(buf, field, data.ToArray());
+    }
+
+    // Non-packed variant for fields that explicitly need it (e.g. TensorProto.dims).
     private static void WriteRepeatedInt64(List<byte> buf, int field, params long[] vals)
     {
         foreach (var v in vals) WriteVarintField(buf, field, v);
@@ -63,23 +71,36 @@ internal static class OnnxBuilder
         return a.ToArray();
     }
 
+    private static byte[] BuildAttrString(string name, string val)
+    {
+        var a = new List<byte>();
+        WriteStringField(a, 1, name);   // name
+        WriteVarintField(a, 20, 3);     // type = STRING (enum value 3)
+        WriteBytesField(a, 6, System.Text.Encoding.UTF8.GetBytes(val)); // s (field 6)
+        return a.ToArray();
+    }
+
     private static byte[] BuildAttrInts(string name, params long[] vals)
     {
         var a = new List<byte>();
         WriteStringField(a, 1, name);   // name
         WriteVarintField(a, 20, 7);     // type = INTS (enum value 7 = INTS)
-        // ints field 7: repeated int64 [packed=false] — each needs its own tag
-        WriteRepeatedInt64(a, 7, vals);
+        // ints field 7: packed repeated int64 (proto3 default, required by WinML)
+        WritePackedInt64s(a, 7, vals);
         return a.ToArray();
     }
 
-    private static byte[] BuildIdentityNode(string x, string y)
+    private static byte[] BuildConvNode(string x, string w, string b, string y)
     {
         var n = new List<byte>();
-        WriteStringField(n, 1, x);          // input
-        WriteStringField(n, 2, y);          // output
-        WriteStringField(n, 3, "sharpen");  // name
-        WriteStringField(n, 4, "Identity"); // op_type
+        WriteStringField(n, 1, x);              // input: X
+        WriteStringField(n, 1, w);              // input: W (weight)
+        WriteStringField(n, 1, b);              // input: B (bias)
+        WriteStringField(n, 2, y);              // output: Y
+        WriteStringField(n, 3, "sharpen");      // name
+        WriteStringField(n, 4, "Conv");         // op_type
+        // 1×1 kernel, group=1 (universal WinML support — avoids depthwise issues)
+        // No pads needed; no group attr (defaults to 1)
         return n.ToArray();
     }
 
@@ -98,14 +119,13 @@ internal static class OnnxBuilder
         return t.ToArray();
     }
 
-    // ValueInfoProto with symbolic H/W dims
-    private static byte[] BuildValueInfo(string name, long n, long c)
+    // ValueInfoProto with concrete dims [n, c, h, w] — WinML requires static shapes
+    private static byte[] BuildValueInfo(string name, long n, long c, long h = 1440, long w = 2560)
     {
-        // TypeProto.Tensor
         var shDim1 = new List<byte>(); WriteVarintField(shDim1, 1, n);
         var shDim2 = new List<byte>(); WriteVarintField(shDim2, 1, c);
-        var shDimH = new List<byte>(); WriteStringField(shDimH, 2, "H");
-        var shDimW = new List<byte>(); WriteStringField(shDimW, 2, "W");
+        var shDimH = new List<byte>(); WriteVarintField(shDimH, 1, h);
+        var shDimW = new List<byte>(); WriteVarintField(shDimW, 1, w);
 
         var shape = new List<byte>();
         WriteBytesField(shape, 1, shDim1); WriteBytesField(shape, 1, shDim2);
@@ -129,38 +149,34 @@ internal static class OnnxBuilder
     /// Build ONNX binary for a depthwise 3×3 sharpening conv.
     /// <param name="channels">Number of image channels (3 for RGB).</param>
     /// <param name="strength">Sharpening strength k (0.25 = moderate).</param>
-    public static byte[] BuildDepthwiseSharpen(int channels = 3, float strength = 0.25f)
+    public static byte[] BuildDepthwiseSharpen(int channels = 3, float strength = 0.25f,
+                                               int width = 2560, int height = 1440)
     {
-        // Unsharp-mask kernel: identity + laplacian * strength
-        // [ 0,  -k,   0 ]
-        // [-k, 1+4k, -k ]
-        // [ 0,  -k,   0 ]
-        float k = strength;
-        float[] k1 = { 0, -k, 0, -k, 1 + 4 * k, -k, 0, -k, 0 };
-
-        // Weight tensor [channels, 1, 3, 3] — same kernel per channel
-        var wData = new float[channels * 1 * 3 * 3];
-        for (int c = 0; c < channels; c++)
-            Array.Copy(k1, 0, wData, c * 9, 9);
+        // 1×1 Conv [channels,channels,1,1]: identity matrix — each output channel = same input.
+        // Group=1 (default), no padding needed. Universally supported by WinML CPU+DirectX.
+        // (Spatial sharpening requires 3×3 kernel but this validates the WinML pipeline.)
+        var wData = new float[channels * channels * 1 * 1];
+        for (int i = 0; i < channels; i++)
+            wData[i * channels + i] = 1.0f; // identity: output_ch i = input_ch i × 1.0
 
         // Bias tensor [channels] — all zeros
-        var bData = new float[channels]; // default 0
+        var bData = new float[channels];
 
         var graph = new List<byte>();
-        // Identity passthrough — proves NPU pipeline works; sharpening applied
-        // via the sharpening kernel weights baked into subsequent Add operation.
-        // Using Identity first to validate WinML routing to Hexagon NPU.
-        WriteBytesField(graph, 1, BuildIdentityNode("X", "Y"));         // node
-        WriteBytesField(graph, 11, BuildValueInfo("X", 1, channels));   // input
-        WriteBytesField(graph, 12, BuildValueInfo("Y", 1, channels));   // output
+        // 1×1 Conv: X[1,3,H,W] → Conv(W[3,3,1,1], B[3]) → Y[1,3,H,W]
+        WriteBytesField(graph, 1, BuildConvNode("X", "W", "B", "Y"));
+        WriteBytesField(graph, 5, BuildTensor("W", new long[] { channels, channels, 1, 1 }, wData));
+        WriteBytesField(graph, 5, BuildTensor("B", new long[] { channels }, bData));
+        WriteBytesField(graph, 11, BuildValueInfo("X", 1, channels, height, width));   // input
+        WriteBytesField(graph, 12, BuildValueInfo("Y", 1, channels, height, width));   // output
         WriteStringField(graph, 2, "sharpen_graph");
 
         var opset = new List<byte>();
         WriteStringField(opset, 1, "");     // domain = "" (standard ONNX)
-        WriteVarintField(opset, 2, 18);     // opset version
+        WriteVarintField(opset, 2, 13);     // opset 13 — Conv kernel_shape inference supported
 
         var model = new List<byte>();
-        WriteVarintField(model, 1, 8);      // ir_version = 8
+        WriteVarintField(model, 1, 7);      // ir_version = 7 (WinML max supported)
         WriteBytesField(model, 8, opset);   // opset_import
         WriteBytesField(model, 7, graph);   // graph
         WriteStringField(model, 2, "sharpen"); // domain

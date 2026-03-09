@@ -124,6 +124,7 @@ public sealed class SrPipeline : IDisposable
                                                           _inputBuf);
             var binding = new LearningModelBinding(_session);
             binding.Bind("X", inputTensor);
+            ++_inferCount;
             var result = await _session.EvaluateAsync(binding, "frame");
 
             // Fast output extraction via ITensorNative (avoids WinRT ABI copy)

@@ -68,6 +68,7 @@ public sealed partial class MainPage : Page
             {
                 ConnectingText.Text = "";
                 InitAgentLoop();
+                ApplyAspectRatio(); // size renderer to native FB aspect ratio
                 FpsText.Visibility = Visibility.Visible;
                 _fpsTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
                 _fpsTimer.Tick += (_, _) =>
@@ -117,6 +118,39 @@ public sealed partial class MainPage : Page
     private void BackToLoginBtn_Click (object s, RoutedEventArgs e) => _session.Disconnect();
     private void SharpnessSlider_ValueChanged(object s, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
         => KvmRenderer.Sharpness = (float)(e.NewValue / 100.0);
+
+    // Maintain native framebuffer aspect ratio — letterbox with black bars.
+    private void KvmContainer_SizeChanged(object s, SizeChangedEventArgs e)
+        => ApplyAspectRatio();
+
+    private void ApplyAspectRatio()
+    {
+        int fbW = _session.FramebufferWidth;
+        int fbH = _session.FramebufferHeight;
+        if (fbW <= 0 || fbH <= 0) return;  // not connected yet
+
+        double cW = KvmContainer.ActualWidth;
+        double cH = KvmContainer.ActualHeight;
+        if (cW <= 0 || cH <= 0) return;
+
+        double fbAspect = (double)fbW / fbH;
+        double cAspect  = cW / cH;
+
+        double rendW, rendH;
+        if (fbAspect >= cAspect)
+        {
+            rendW = cW;
+            rendH = cW / fbAspect;
+        }
+        else
+        {
+            rendH = cH;
+            rendW = cH * fbAspect;
+        }
+
+        KvmRenderer.Width  = rendW;
+        KvmRenderer.Height = rendH;
+    }
 
     private void NpuToggle_Toggled(object s, RoutedEventArgs e)
     {

@@ -90,17 +90,17 @@ internal static class OnnxBuilder
         return a.ToArray();
     }
 
-    private static byte[] BuildConvNode(string x, string w, string b, string y)
+    // Simple op nodes for unsharp mask pipeline
+
+    private static byte[] BuildNode(string opType, string name, string[] inputs, string[] outputs,
+                                    params byte[][] attributes)
     {
         var n = new List<byte>();
-        WriteStringField(n, 1, x);              // input: X
-        WriteStringField(n, 1, w);              // input: W (weight)
-        WriteStringField(n, 1, b);              // input: B (bias)
-        WriteStringField(n, 2, y);              // output: Y
-        WriteStringField(n, 3, "sharpen");      // name
-        WriteStringField(n, 4, "Conv");         // op_type
-        // 1×1 kernel, group=1 (universal WinML support — avoids depthwise issues)
-        // No pads needed; no group attr (defaults to 1)
+        foreach (var inp in inputs)  WriteStringField(n, 1, inp);
+        foreach (var outp in outputs) WriteStringField(n, 2, outp);
+        WriteStringField(n, 3, name);
+        WriteStringField(n, 4, opType);
+        foreach (var attr in attributes) WriteBytesField(n, 5, attr);
         return n.ToArray();
     }
 
@@ -146,27 +146,38 @@ internal static class OnnxBuilder
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /// Build ONNX binary for a depthwise 3×3 sharpening conv.
-    /// <param name="channels">Number of image channels (3 for RGB).</param>
-    /// <param name="strength">Sharpening strength k (0.25 = moderate).</param>
-    public static byte[] BuildDepthwiseSharpen(int channels = 3, float strength = 0.25f,
+    /// Build ONNX unsharp mask model: output = X + strength*(X − AveragePool(X))
+    /// Uses only AveragePool/Sub/Mul/Add — all natively supported on Hexagon HTP.
+    /// No Conv with padding needed, avoiding the pads attribute encoding issues.
+    public static byte[] BuildDepthwiseSharpen(int channels = 3, float strength = 0.5f,
                                                int width = 2560, int height = 1440)
     {
-        // 1×1 Conv [channels,channels,1,1]: identity matrix — each output channel = same input.
-        // Group=1 (default), no padding needed. Universally supported by WinML CPU+DirectX.
-        // (Spatial sharpening requires 3×3 kernel but this validates the WinML pipeline.)
-        var wData = new float[channels * channels * 1 * 1];
-        for (int i = 0; i < channels; i++)
-            wData[i * channels + i] = 1.0f; // identity: output_ch i = input_ch i × 1.0
-
-        // Bias tensor [channels] — all zeros
-        var bData = new float[channels];
+        // strength scalar initializer [1,1,1,1] — broadcasts to [1,channels,H,W]
+        var strengthData = new float[] { strength };
 
         var graph = new List<byte>();
-        // 1×1 Conv: X[1,3,H,W] → Conv(W[3,3,1,1], B[3]) → Y[1,3,H,W]
-        WriteBytesField(graph, 1, BuildConvNode("X", "W", "B", "Y"));
-        WriteBytesField(graph, 5, BuildTensor("W", new long[] { channels, channels, 1, 1 }, wData));
-        WriteBytesField(graph, 5, BuildTensor("B", new long[] { channels }, bData));
+
+        // AveragePool(X, kernel=[3,3], auto_pad=SAME_UPPER) → blur
+        WriteBytesField(graph, 1, BuildNode("AveragePool", "blur",
+            new[] { "X" }, new[] { "blur" },
+            BuildAttrString("auto_pad", "SAME_UPPER"),
+            BuildAttrInts("kernel_shape", 3, 3)));
+
+        // Sub(X, blur) → hf   (high-frequency = original − blurred)
+        WriteBytesField(graph, 1, BuildNode("Sub", "hf",
+            new[] { "X", "blur" }, new[] { "hf" }));
+
+        // Mul(hf, strength_init) → hf_scaled
+        WriteBytesField(graph, 1, BuildNode("Mul", "hf_scaled",
+            new[] { "hf", "strength_init" }, new[] { "hf_scaled" }));
+
+        // Add(X, hf_scaled) → Y   (sharpened = original + scaled high-freq)
+        WriteBytesField(graph, 1, BuildNode("Add", "sharpen",
+            new[] { "X", "hf_scaled" }, new[] { "Y" }));
+
+        // Initializer: strength scalar
+        WriteBytesField(graph, 5, BuildTensor("strength_init",
+            new long[] { 1, 1, 1, 1 }, strengthData));
         WriteBytesField(graph, 11, BuildValueInfo("X", 1, channels, height, width));   // input
         WriteBytesField(graph, 12, BuildValueInfo("Y", 1, channels, height, width));   // output
         WriteStringField(graph, 2, "sharpen_graph");

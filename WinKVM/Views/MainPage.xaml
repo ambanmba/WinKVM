@@ -80,14 +80,21 @@
 
             <!-- Connected: KVM view + optional AI panel -->
             <Grid x:Name="ConnectedPanel" Visibility="Collapsed" ColumnDefinitions="*,Auto">
-                <!-- D3D11 framebuffer renderer -->
-                <rendering:D3DFramebufferControl x:Name="KvmRenderer" Grid.Column="0"
+                <!-- Letterbox container: KvmRenderer is centred and sized to preserve
+                     the remote framebuffer's native aspect ratio. -->
+                <Grid x:Name="KvmContainer" Grid.Column="0"
+                      Background="Black"
+                      SizeChanged="KvmContainer_SizeChanged">
+                <rendering:D3DFramebufferControl x:Name="KvmRenderer"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
                     PointerMoved="KvmRenderer_PointerMoved"
                     PointerPressed="KvmRenderer_PointerPressed"
                     PointerReleased="KvmRenderer_PointerReleased"
                     PointerWheelChanged="KvmRenderer_PointerWheelChanged"
                     KeyDown="KvmRenderer_KeyDown"
                     KeyUp="KvmRenderer_KeyUp"/>
+                </Grid>
 
                 <!-- AI chat panel (collapsible) -->
                 <local:AIChatPanel x:Name="AiPanel" Grid.Column="1" Width="320" Visibility="Collapsed"/>

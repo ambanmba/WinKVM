@@ -463,7 +463,8 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         // Reads _displayTex (YCbCr-converted frame) → writes _casOutTex.
         // Skipped when NPU mode is active, sharpness is zero, or unavailable.
         var presentSRV = _displaySRV; // default: present unsharpened
-        if (!_npuEnabled && Sharpness > 0f && _casCS is not null && _casOutUAV is not null && _casCB is not null)
+        // CAS runs after NPU (or alone) — effects stack: NPU colour → GPU sharpen
+        if (Sharpness > 0f && _casCS is not null && _casOutUAV is not null && _casCB is not null)
         {
             // Update sharpness constant via Map/WriteDiscard (Dynamic CB)
             unsafe

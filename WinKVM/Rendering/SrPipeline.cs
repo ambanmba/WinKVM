@@ -115,41 +115,43 @@ public sealed class SrPipeline : IDisposable
                 $"[{DateTime.Now:HH:mm:ss}] EP dir: {qnnEpDir ?? "n/a"}\n" +
                 $"[{DateTime.Now:HH:mm:ss}] ORT dir: {qnnOrtDir ?? "n/a"}\n");
 
+            System.IO.File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] Creating SessionOptions\n");
             var opts = new SessionOptions();
             opts.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
             opts.InterOpNumThreads = 1;
             opts.IntraOpNumThreads = 1;
+            System.IO.File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] SessionOptions ok\n");
 
             string usedProvider = "CPU";
             if (qnnEpDir is not null && qnnOrtDir is not null)
             {
                 var htpPath  = System.IO.Path.Combine(qnnEpDir, "QnnHtp.dll");
                 var qnnEpDll = System.IO.Path.Combine(qnnOrtDir, "onnxruntime_providers_qnn.dll");
-                var qnnOrtDll= System.IO.Path.Combine(qnnOrtDir, "onnxruntime.dll");
 
-                // Add both directories to PATH so Windows finds all QNN dependencies
+                // Add qnnOrtDir FIRST — contains QnnHtp.dll matched to onnxruntime_providers_qnn.dll
                 var envPath = Environment.GetEnvironmentVariable("PATH") ?? "";
-                foreach (var d in new[] { qnnEpDir, qnnOrtDir })
+                foreach (var d in new[] { qnnOrtDir, qnnEpDir })
                     if (!envPath.Contains(d)) envPath = d + ";" + envPath;
                 Environment.SetEnvironmentVariable("PATH", envPath);
+                System.IO.File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] PATH updated (qnnOrtDir first)\n");
 
-                // Pre-load the QNN EP DLL — registers QNN provider with the ORT instance
-                try { NativeLibrary.Load(qnnEpDll); }
-                catch (Exception ex) {
-                    System.IO.File.AppendAllText(_log,
-                        $"[{DateTime.Now:HH:mm:ss}] QNN EP dll load: {ex.Message.Split('\n')[0]}\n");
-                }
-
+                // Let ONNX Runtime find and load onnxruntime_providers_qnn.dll automatically
+                // via the registered Windows package. Use just filename for backend_path
+                // (matches genai_config.json pattern from AI Toolkit phi-3.5/deepseek models).
+                System.IO.File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] AppendExecutionProvider QNN\n");
                 try
                 {
                     opts.AppendExecutionProvider("QNN", new Dictionary<string, string>
                     {
-                        { "backend_path",             htpPath },
-                        { "device_id",                "0" },
-                        { "enable_htp_fp16_precision","1" },
-                        { "htp_performance_mode",     "sustained_high_performance" },
+                        { "backend_path",                              "QnnHtp.dll" }, // filename only — found via PATH
+                        { "device_id",                                 "0" },
+                        { "enable_htp_fp16_precision",                "1" },
+                        { "htp_performance_mode",                      "sustained_high_performance" },
+                        { "htp_graph_finalization_optimization_mode",  "3" },
+                        { "soc_model",                                 "60" }, // Snapdragon X
                     });
                     usedProvider = "QnnHtp (Hexagon NPU)";
+                    System.IO.File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] QNN EP appended\n");
                 }
                 catch (Exception ex)
                 {

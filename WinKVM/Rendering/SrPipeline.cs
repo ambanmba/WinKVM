@@ -34,31 +34,70 @@ public sealed class SrPipeline : IDisposable
     private static readonly string _log = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "winkvm_npu.log");
 
+    // Static constructor: pre-load ALL paired DLLs from the WindowsApps QNN ORT bundle
+    // before anything else can load the NuGet's incompatible versions.
+    static SrPipeline()
+    {
+        var (_, ortDir) = FindQnnDirs();
+        if (ortDir is null) return;
+        try
+        {
+            // Load onnxruntime.dll + onnxruntime_providers_shared.dll from the QNN bundle.
+            // Once in memory, Windows finds these (by name) before the NuGet copies.
+            var ortHandle    = NativeLibrary.Load(System.IO.Path.Combine(ortDir, "onnxruntime.dll"));
+            var sharedPath   = System.IO.Path.Combine(ortDir, "onnxruntime_providers_shared.dll");
+            var sharedHandle = System.IO.File.Exists(sharedPath)
+                             ? NativeLibrary.Load(sharedPath) : IntPtr.Zero;
+
+            // Redirect all P/Invoke calls so the ORT C# wrapper uses these handles
+            NativeLibrary.SetDllImportResolver(typeof(InferenceSession).Assembly,
+                (libName, _, _) =>
+                    libName == "onnxruntime"                  ? ortHandle    :
+                    libName == "onnxruntime_providers_shared" ? sharedHandle :
+                    IntPtr.Zero);
+
+            System.IO.File.AppendAllText(_log,
+                $"[{DateTime.Now:HH:mm:ss}] Static: pre-loaded QNN-paired ORT DLLs from {ortDir}\n");
+        }
+        catch (Exception ex)
+        {
+            System.IO.File.AppendAllText(_log,
+                $"[{DateTime.Now:HH:mm:ss}] Static init failed: {ex.Message.Split('\n')[0]}\n");
+        }
+    }
+
     public bool IsAvailable => _ready && !_disposed;
 
-    /// Locate the QNN DLL directory on this machine.
-    private static string? FindQnnDir()
+    /// Locate the QNN directories: returns (qnnEpDir, qnnOrtDir) where:
+    ///   qnnEpDir  = directory containing QnnHtp.dll (for backend_path)
+    ///   qnnOrtDir = directory containing onnxruntime.dll + onnxruntime_providers_qnn.dll
+    ///               (the paired ORT build that was compiled with QNN EP support)
+    private static (string? epDir, string? ortDir) FindQnnDirs()
     {
         var appsRoot = System.IO.Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
             "WindowsApps");
-        if (!System.IO.Directory.Exists(appsRoot)) return null;
+        if (!System.IO.Directory.Exists(appsRoot)) return (null, null);
 
-        // Prefer the dedicated QNN EP package (most up-to-date)
+        string? epDir = null, ortDir = null;
+
+        // QNN EP DLLs (QnnHtp.dll etc.)
         foreach (var dir in System.IO.Directory.GetDirectories(appsRoot, "WindowsWorkload.EP.Qualcomm.QNN*"))
         {
             var ep = System.IO.Path.Combine(dir, "ExecutionProvider");
             if (System.IO.File.Exists(System.IO.Path.Combine(ep, "QnnHtp.dll")))
-                return ep;
+            { epDir = ep; break; }
         }
-        // Fall back to OnnxRuntime QNN bundle
+
+        // OnnxRuntime build paired with QNN EP — has BOTH onnxruntime.dll AND onnxruntime_providers_qnn.dll
         foreach (var dir in System.IO.Directory.GetDirectories(appsRoot, "WindowsWorkload.OnnxRuntime.Qnn*"))
         {
-            var ep = System.IO.Path.Combine(dir, "ExecutionProvider");
-            if (System.IO.File.Exists(System.IO.Path.Combine(ep, "QnnHtp.dll")))
-                return ep;
+            if (System.IO.File.Exists(System.IO.Path.Combine(dir, "onnxruntime.dll")) &&
+                System.IO.File.Exists(System.IO.Path.Combine(dir, "onnxruntime_providers_qnn.dll")))
+            { ortDir = dir; break; }
         }
-        return null;
+
+        return (epDir, ortDir);
     }
 
     public async Task<bool> InitAsync(int width = 2560, int height = 1440)
@@ -71,10 +110,10 @@ public sealed class SrPipeline : IDisposable
             System.IO.File.AppendAllText(_log,
                 $"[{DateTime.Now:HH:mm:ss}] ONNX {onnxBytes.Length} bytes\n");
 
-            // Find QNN DLL directory and add to PATH so ONNX Runtime can load it
-            var qnnDir = FindQnnDir();
+            var (qnnEpDir, qnnOrtDir) = FindQnnDirs();
             System.IO.File.AppendAllText(_log,
-                $"[{DateTime.Now:HH:mm:ss}] QNN dir: {qnnDir ?? "not found"}\n");
+                $"[{DateTime.Now:HH:mm:ss}] EP dir: {qnnEpDir ?? "n/a"}\n" +
+                $"[{DateTime.Now:HH:mm:ss}] ORT dir: {qnnOrtDir ?? "n/a"}\n");
 
             var opts = new SessionOptions();
             opts.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
@@ -82,14 +121,24 @@ public sealed class SrPipeline : IDisposable
             opts.IntraOpNumThreads = 1;
 
             string usedProvider = "CPU";
-            if (qnnDir is not null)
+            if (qnnEpDir is not null && qnnOrtDir is not null)
             {
-                var htpPath = System.IO.Path.Combine(qnnDir, "QnnHtp.dll");
+                var htpPath  = System.IO.Path.Combine(qnnEpDir, "QnnHtp.dll");
+                var qnnEpDll = System.IO.Path.Combine(qnnOrtDir, "onnxruntime_providers_qnn.dll");
+                var qnnOrtDll= System.IO.Path.Combine(qnnOrtDir, "onnxruntime.dll");
 
-                // Add QNN dir to PATH so ONNX Runtime can load dependent QNN DLLs
-                var path = Environment.GetEnvironmentVariable("PATH") ?? "";
-                if (!path.Contains(qnnDir))
-                    Environment.SetEnvironmentVariable("PATH", qnnDir + ";" + path);
+                // Add both directories to PATH so Windows finds all QNN dependencies
+                var envPath = Environment.GetEnvironmentVariable("PATH") ?? "";
+                foreach (var d in new[] { qnnEpDir, qnnOrtDir })
+                    if (!envPath.Contains(d)) envPath = d + ";" + envPath;
+                Environment.SetEnvironmentVariable("PATH", envPath);
+
+                // Pre-load the QNN EP DLL — registers QNN provider with the ORT instance
+                try { NativeLibrary.Load(qnnEpDll); }
+                catch (Exception ex) {
+                    System.IO.File.AppendAllText(_log,
+                        $"[{DateTime.Now:HH:mm:ss}] QNN EP dll load: {ex.Message.Split('\n')[0]}\n");
+                }
 
                 try
                 {
@@ -106,18 +155,6 @@ public sealed class SrPipeline : IDisposable
                 {
                     System.IO.File.AppendAllText(_log,
                         $"[{DateTime.Now:HH:mm:ss}] QnnHtp failed: {ex.Message.Split('\n')[0]}\n");
-
-                    // Try CPU backend as fallback within QNN
-                    try
-                    {
-                        var cpuPath = System.IO.Path.Combine(qnnDir, "QnnCpu.dll");
-                        opts.AppendExecutionProvider("QNN", new Dictionary<string, string>
-                        {
-                            { "backend_path", cpuPath },
-                        });
-                        usedProvider = "QnnCpu";
-                    }
-                    catch { /* fall through to ORT CPU */ }
                 }
             }
 

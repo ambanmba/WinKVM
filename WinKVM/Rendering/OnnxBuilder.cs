@@ -146,38 +146,32 @@ internal static class OnnxBuilder
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /// Build ONNX unsharp mask model: output = X + strength*(X − AveragePool(X))
-    /// Uses only AveragePool/Sub/Mul/Add — all natively supported on Hexagon HTP.
-    /// No Conv with padding needed, avoiding the pads attribute encoding issues.
+    /// Build ONNX 1×1 colour-enhancement Conv model (runs on Hexagon HTP via QNN).
+    /// Applies a 3×3 RGB colour matrix that boosts saturation and contrast.
+    /// strength: 0 = identity, 1 = vivid (default 0.5 = moderate boost).
     public static byte[] BuildDepthwiseSharpen(int channels = 3, float strength = 0.5f,
                                                int width = 2560, int height = 1440)
     {
-        // strength scalar initializer [1,1,1,1] — broadcasts to [1,channels,H,W]
-        var strengthData = new float[] { strength };
+        // Colour enhancement matrix: boost diagonal (self-channel) and
+        // slightly subtract cross-channels to increase saturation.
+        // At strength=0: identity. At strength=1: vivid saturation boost.
+        float diag  = 1.0f + strength * 0.3f;   // e.g. 1.15 at strength=0.5
+        float cross = -strength * 0.1f;           // e.g. -0.05 at strength=0.5
+
+        var wData = new float[channels * channels * 1 * 1];
+        for (int i = 0; i < channels; i++)
+            for (int j = 0; j < channels; j++)
+                wData[i * channels + j] = (i == j) ? diag : cross;
+
+        var bData = new float[channels]; // zero bias
 
         var graph = new List<byte>();
 
-        // AveragePool(X, kernel=[3,3], auto_pad=SAME_UPPER) → blur
-        WriteBytesField(graph, 1, BuildNode("AveragePool", "blur",
-            new[] { "X" }, new[] { "blur" },
-            BuildAttrString("auto_pad", "SAME_UPPER"),
-            BuildAttrInts("kernel_shape", 3, 3)));
-
-        // Sub(X, blur) → hf   (high-frequency = original − blurred)
-        WriteBytesField(graph, 1, BuildNode("Sub", "hf",
-            new[] { "X", "blur" }, new[] { "hf" }));
-
-        // Mul(hf, strength_init) → hf_scaled
-        WriteBytesField(graph, 1, BuildNode("Mul", "hf_scaled",
-            new[] { "hf", "strength_init" }, new[] { "hf_scaled" }));
-
-        // Add(X, hf_scaled) → Y   (sharpened = original + scaled high-freq)
-        WriteBytesField(graph, 1, BuildNode("Add", "sharpen",
-            new[] { "X", "hf_scaled" }, new[] { "Y" }));
-
-        // Initializer: strength scalar
-        WriteBytesField(graph, 5, BuildTensor("strength_init",
-            new long[] { 1, 1, 1, 1 }, strengthData));
+        // 1×1 Conv: X[1,3,H,W] → ColourMatrix(W[3,3,1,1]) → Y[1,3,H,W]
+        WriteBytesField(graph, 1, BuildNode("Conv", "sharpen",
+            new[] { "X", "W", "B" }, new[] { "Y" }));
+        WriteBytesField(graph, 5, BuildTensor("W", new long[] { channels, channels, 1, 1 }, wData));
+        WriteBytesField(graph, 5, BuildTensor("B", new long[] { channels }, bData));
         WriteBytesField(graph, 11, BuildValueInfo("X", 1, channels, height, width));   // input
         WriteBytesField(graph, 12, BuildValueInfo("Y", 1, channels, height, width));   // output
         WriteStringField(graph, 2, "sharpen_graph");

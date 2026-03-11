@@ -67,6 +67,11 @@ public sealed class SrPipeline : IDisposable
 
     public bool IsAvailable => _ready && !_disposed;
 
+    /// Calling this static method triggers the static constructor, which pre-loads
+    /// the QNN-paired ORT DLLs and sets NativeLibrary.SetDllImportResolver.
+    /// Call once before creating any InferenceSession that needs QNN EP.
+    public static void EnsureQnnBootstrapped() { }
+
     /// Locate the QNN directories: returns (qnnEpDir, qnnOrtDir) where:
     ///   qnnEpDir  = directory containing QnnHtp.dll (for backend_path)
     ///   qnnOrtDir = directory containing onnxruntime.dll + onnxruntime_providers_qnn.dll

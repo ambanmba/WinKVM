@@ -18,6 +18,10 @@ namespace WinKVM.Rendering;
 /// inW/inH are read from the model; outW/outH must equal display resolution.
 public sealed class SrZoomPipeline : IDisposable
 {
+    // Calling a static member of SrPipeline forces its static constructor to run first,
+    // which pre-loads the QNN-paired ORT DLLs and sets NativeLibrary.SetDllImportResolver.
+    static SrZoomPipeline() { SrPipeline.EnsureQnnBootstrapped(); }
+
     private InferenceSession? _session;
     private bool              _ready;
     private bool              _disposed;
@@ -61,14 +65,33 @@ public sealed class SrZoomPipeline : IDisposable
             var opts = new SessionOptions();
             opts.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
 
-            // Prefer Adreno GPU via QNN; ONNX Runtime falls back to CPU.
-            try
+            // Try Hexagon NPU (HTP) first — same backend as per-frame colour enhancement.
+            // FP16 mode lets the NPU run float32 models by auto-converting to FP16.
+            // Falls back through QNN GPU → CPU automatically on unsupported ops.
+            var (qnnEpDir, qnnOrtDir) = FindQnnDirs();
+            if (qnnEpDir is not null && qnnOrtDir is not null)
             {
-                opts.AppendExecutionProvider("QNN",
-                    new Dictionary<string, string> { { "backend_path", "QnnGpu.dll" } });
-                Log("SR: QNN GPU EP registered");
+                // Add both dirs to PATH: qnnOrtDir has onnxruntime_providers_qnn.dll,
+                // qnnEpDir has QnnHtp.dll. Must be first so Windows finds these before NuGet copies.
+                var envPath = Environment.GetEnvironmentVariable("PATH") ?? "";
+                foreach (var d in new[] { qnnOrtDir, qnnEpDir })
+                    if (!envPath.Contains(d)) envPath = d + ";" + envPath;
+                Environment.SetEnvironmentVariable("PATH", envPath);
+                try
+                {
+                    opts.AppendExecutionProvider("QNN", new Dictionary<string, string>
+                    {
+                        { "backend_path",                             "QnnHtp.dll" },
+                        { "device_id",                               "0" },
+                        { "enable_htp_fp16_precision",               "1" },
+                        { "htp_performance_mode",                    "burst" },
+                        { "htp_graph_finalization_optimization_mode","3" },
+                        { "soc_model",                               "60" },
+                    });
+                    Log("SR: QNN HTP (Hexagon NPU) EP registered");
+                }
+                catch (Exception ex) { Log($"SR: QNN HTP unavailable: {ex.Message.Split('\n')[0]}"); }
             }
-            catch { /* not available on this machine */ }
 
             _session = await Task.Run(() => new InferenceSession(ModelPath, opts));
 
@@ -228,4 +251,24 @@ public sealed class SrZoomPipeline : IDisposable
 
     private void Log(string msg) =>
         File.AppendAllText(_log, $"[{DateTime.Now:HH:mm:ss}] {msg}\n");
+
+    private static (string? epDir, string? ortDir) FindQnnDirs()
+    {
+        var appsRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WindowsApps");
+        if (!Directory.Exists(appsRoot)) return (null, null);
+        string? epDir = null, ortDir = null;
+        foreach (var d in Directory.GetDirectories(appsRoot, "WindowsWorkload.EP.Qualcomm.QNN*"))
+        {
+            var ep = Path.Combine(d, "ExecutionProvider");
+            if (File.Exists(Path.Combine(ep, "QnnHtp.dll"))) { epDir = ep; break; }
+        }
+        foreach (var d in Directory.GetDirectories(appsRoot, "WindowsWorkload.OnnxRuntime.Qnn*"))
+        {
+            if (File.Exists(Path.Combine(d, "onnxruntime.dll")) &&
+                File.Exists(Path.Combine(d, "onnxruntime_providers_qnn.dll")))
+            { ortDir = d; break; }
+        }
+        return (epDir, ortDir);
+    }
 }

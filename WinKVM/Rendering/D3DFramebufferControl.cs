@@ -684,7 +684,12 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
                 zp[3] = srZoomActive ? 1f : _zoomUvSclY;
                 zp[4] = srZoomActive ? 1.0f / (_srZoomPipeline?.OutW ?? _displayW) : 1.0f / _displayW;
                 zp[5] = srZoomActive ? 1.0f / (_srZoomPipeline?.OutH ?? _displayH) : 1.0f / _displayH;
-                zp[6] = srZoomActive ? 1.0f : _zoomLevel; // 1.0 = no Lanczos/unsharp on SR output
+                // When showing SR output: tell Display.hlsl the effective zoom so Lanczos
+                // activates for the final 512→2560 upscale (outW/displayW ≈ 0.2 → reciprocal ≈ 5×).
+                float srDispScale = srZoomActive
+                    ? (float)_displayW / (_srZoomPipeline?.OutW ?? _displayW)
+                    : _zoomLevel;
+                zp[6] = srDispScale;
                 zp[7] = 0f;
                 _ctx.Unmap(_displayZoomCB, 0);
             }

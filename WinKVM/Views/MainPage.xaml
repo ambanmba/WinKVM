@@ -14,6 +14,7 @@
             <AppBarButton x:Name="CtrlAltDelBtn" Icon="Keyboard"   Label="Ctrl-Alt-Del"    Click="CtrlAltDelBtn_Click"/>
             <AppBarSeparator/>
             <AppBarButton x:Name="ScreenshotBtn" Icon="Camera"     Label="Screenshot"      Click="ScreenshotBtn_Click"/>
+            <AppBarButton x:Name="RecordBtn"     Icon="Video"      Label="Record"          Click="RecordBtn_Click" IsEnabled="False"/>
             <AppBarSeparator/>
             <AppBarButton x:Name="SendTextBtn"   Icon="Edit"       Label="Send Text"       Click="SendTextBtn_Click"/>
             <AppBarButton x:Name="PasteBtn"      Icon="Paste"      Label="Paste Clipboard" Click="PasteBtn_Click"/>

@@ -73,6 +73,31 @@ public sealed class ERICSession : INotifyPropertyChanged
     private Audio.AudioPlayer?       _audioPlayer;
     private CancellationTokenSource? _rapCts;
 
+    // Screen recording
+    private Recording.ScreenRecorder? _recorder;
+    public  bool IsRecording => _recorder?.IsRecording ?? false;
+
+    public bool StartRecording(string outputPath)
+    {
+        if (_framebuffer is null) return false;
+        var rec = new Recording.ScreenRecorder();
+        bool ok = rec.Start(outputPath,
+                            _framebuffer.Width, _framebuffer.Height);
+        if (!ok) { rec.Dispose(); return false; }
+        _recorder = rec;
+        OnPropertyChanged(nameof(IsRecording));
+        return true;
+    }
+
+    public void StopRecording()
+    {
+        var rec = _recorder;
+        _recorder = null;
+        rec?.Stop();
+        rec?.Dispose();
+        OnPropertyChanged(nameof(IsRecording));
+    }
+
     // RFB session ID — received in ServerInit (0x05), required for RAP connection request
     private uint    _rfbSessionId;
     // e-RIC session ID string — from ConnectionParams, used for RAP type-5 auth
@@ -146,6 +171,7 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     private void ReleaseResources()
     {
+        StopRecording();
         StopAudio();
         _conn?.Disconnect();
         _conn = null;
@@ -181,7 +207,10 @@ public sealed class ERICSession : INotifyPropertyChanged
         _audioPlayer = player;
 
         rap.AudioPacketReceived += (pcm, sr, ch, bits, signed) =>
+        {
             player.Feed(pcm, sr, ch, bits, signed);
+            _recorder?.AddAudioSamples(pcm, sr, ch, bits);
+        };
 
         bool ok = await rap.ConnectAsync(cts.Token);
         if (!ok)
@@ -634,8 +663,11 @@ public sealed class ERICSession : INotifyPropertyChanged
                 int subenc = (enc >> 12) & 0xF;
                 var slice  = allData[cursor..];
                 var planes = _ictDecoder.Decode(slice, rw, rh2, subenc);
-                if (planes is not null && Renderer is { } ren)
-                    ren.UploadYCbCr(planes);
+                if (planes is not null)
+                {
+                    Renderer?.UploadYCbCr(planes);
+                    _recorder?.AddVideoFrameYCbCr(planes);
+                }
                 cursor = allData.Length; // ICT consumes the rest
             }
             else if ((RfbEncoding)enc == RfbEncoding.Raw && _framebuffer is not null)
@@ -646,6 +678,7 @@ public sealed class ERICSession : INotifyPropertyChanged
                 cursor += sz;
                 _dirtyRects.Add((rx, ry, rw, rh2));
                 Renderer?.UploadFramebuffer(_framebuffer, _dirtyRects.Count > 0 ? _dirtyRects : null);
+                _recorder?.AddVideoFrameBGRA(_framebuffer);
             }
             else if ((RfbEncoding)enc == RfbEncoding.Hextile && _framebuffer is not null)
             {

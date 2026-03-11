@@ -69,6 +69,7 @@ public sealed partial class MainPage : Page
             SendTextBtn.IsEnabled    = state == SessionState.Connected;
             PasteBtn.IsEnabled       = state == SessionState.Connected;
             AudioBtn.IsEnabled       = state == SessionState.Connected;
+            RecordBtn.IsEnabled      = state == SessionState.Connected;
             ZoomModeBtn.IsEnabled    = state == SessionState.Connected;
             if (state != SessionState.Connected && _zoomMode)
             {
@@ -180,6 +181,34 @@ public sealed partial class MainPage : Page
         SendTextFlyout.Visibility = SendTextFlyout.Visibility == Visibility.Visible
             ? Visibility.Collapsed : Visibility.Visible;
     }
+    private void RecordBtn_Click(object s, RoutedEventArgs e)
+    {
+        if (_session.IsRecording)
+        {
+            _session.StopRecording();
+            RecordBtn.Icon  = new SymbolIcon(Symbol.Video);
+            RecordBtn.Label = "Record";
+        }
+        else
+        {
+            var ts   = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+            var path = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                "WinKVM", $"WinKVM_{ts}.mp4");
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
+            if (_session.StartRecording(path))
+            {
+                RecordBtn.Icon  = new SymbolIcon(Symbol.Stop);
+                RecordBtn.Label = "Stop Rec";
+                StatusText.Text = $"Recording → {System.IO.Path.GetFileName(path)}";
+            }
+            else
+            {
+                StatusText.Text = "Recording failed to start";
+            }
+        }
+    }
+
     private void AIAgentBtn_Click     (object s, RoutedEventArgs e)
     {
         AiPanel.Visibility = AiPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;

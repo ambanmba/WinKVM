@@ -68,7 +68,37 @@ float4 SampleLanczos(float2 uv)
 float4 PS(VSOut i) : SV_Target
 {
     float2 srcUV = uvOffset + i.uv * uvScale;
-    float4 c = (zoomLevel > 1.49) ? SampleLanczos(srcUV)
-                                   : displayTex.Sample(linearSampler, srcUV);
+
+    float4 c;
+    if (zoomLevel > 1.49)
+    {
+        c = SampleLanczos(srcUV);
+
+        // Adaptive unsharp mask — active above 2× zoom.
+        // Counteracts ICT compression blocking/blur artifacts that become
+        // visible when magnified. Cheap: 4 bilinear taps for the blur estimate,
+        // Lanczos center for the sharp reference. Strength ramps with zoom so
+        // it is subtle at 2× and stronger at 4×+.
+        if (zoomLevel > 1.99)
+        {
+            // Sample blur at 2-source-pixel radius (fixed, independent of zoom)
+            float2 r = srcTexel * 2.0;
+            float4 blur = (
+                displayTex.SampleLevel(linearSampler, srcUV + float2(-r.x,  0.0), 0) +
+                displayTex.SampleLevel(linearSampler, srcUV + float2( r.x,  0.0), 0) +
+                displayTex.SampleLevel(linearSampler, srcUV + float2( 0.0, -r.y), 0) +
+                displayTex.SampleLevel(linearSampler, srcUV + float2( 0.0,  r.y), 0)
+            ) * 0.25;
+
+            // Ramp strength: 0.25 at 2×, capped at 0.65 around 4×+
+            float strength = clamp((zoomLevel - 2.0) * 0.15 + 0.25, 0.0, 0.65);
+            c = saturate(c + strength * (c - blur));
+        }
+    }
+    else
+    {
+        c = displayTex.Sample(linearSampler, srcUV);
+    }
+
     return float4(c.rgb, 1.0);
 }

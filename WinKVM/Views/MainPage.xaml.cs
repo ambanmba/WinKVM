@@ -63,6 +63,8 @@ public sealed partial class MainPage : Page
             ScreenshotBtn.IsEnabled  = state == SessionState.Connected;
             SendTextBtn.IsEnabled    = state == SessionState.Connected;
             PasteBtn.IsEnabled       = state == SessionState.Connected;
+            AudioBtn.IsEnabled       = state == SessionState.Connected;
+            UpdateAudioBtn();
 
             if (state == SessionState.Connected)
             {
@@ -168,6 +170,21 @@ public sealed partial class MainPage : Page
     private void AIAgentBtn_Click     (object s, RoutedEventArgs e)
     {
         AiPanel.Visibility = AiPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private async void AudioBtn_Click(object s, RoutedEventArgs e)
+    {
+        if (_session.IsAudioActive)
+            _session.StopAudio();
+        else
+            await _session.StartAudioAsync();
+        UpdateAudioBtn();
+    }
+
+    private void UpdateAudioBtn()
+    {
+        AudioBtn.Icon  = new SymbolIcon(_session.IsAudioActive ? Symbol.Mute : Symbol.Volume);
+        AudioBtn.Label = _session.IsAudioActive ? "Stop Audio" : "Audio";
     }
 
     private async void ScreenshotBtn_Click(object s, RoutedEventArgs e)

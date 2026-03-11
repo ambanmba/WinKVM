@@ -40,7 +40,12 @@ Port of SwiftKVM (Swift/Metal/macOS) to C#/WinUI 3/Direct3D 11/Windows.
 - NuGet: Microsoft.WindowsAppSDK 1.7, Vortice.Direct3D11 3.8.3, Vortice.DXGI 3.8.3, Vortice.D3DCompiler 3.8.3, Microsoft.AI.DirectML, Tesseract, System.Drawing.Common
 
 ## CLI build (ARM64 host)
-On ARM64 machines, build with `-p:Platform=x64` — the WinAppSDK XamlCompiler.exe is x64-only:
+ARM64 and x64 both build successfully from CLI. Use ARM64 for NPU access:
+```
+dotnet build WinKVM/WinKVM.csproj -c Debug -p:Platform=ARM64
+dotnet run --project WinKVM/WinKVM.csproj -c Debug -p:Platform=ARM64
+```
+x64 emulated builds also work but CANNOT access Hexagon NPU (QNN DLLs are ARM64-only):
 ```
 dotnet build WinKVM/WinKVM.csproj -c Debug -p:Platform=x64
 dotnet run --project WinKVM/WinKVM.csproj -c Debug -p:Platform=x64

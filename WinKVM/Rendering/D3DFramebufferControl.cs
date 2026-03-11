@@ -53,13 +53,21 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
     /// CAS sharpness 0.0–1.0 (0 = off, 0.6 = default). Set from UI.
     public float Sharpness { get; set; } = 0.6f;
 
-    // ── NPU sharpening (Windows.AI.MachineLearning → Hexagon NPU) ────────────
-    private SrPipeline? _srPipeline;
-    private volatile bool _npuBusy;
-    private int _npuLogCount;
+    // ── NPU enhancement (Hexagon NPU via ONNX Runtime + QNN) ─────────────────
+    // 3-phase pipeline to keep D3D11 calls on the render thread:
+    //   Phase 1 (render thread): PrepareStagingRead  — capture displayTex → _inputBuf
+    //   Phase 2 (thread pool):   RunInferenceAsync   — ONNX inference → _outputBuf
+    //   Phase 3 (render thread): CommitToTexture     — _outputBuf → _npuOutTex
+    // _npuOutSRV is then used as CAS source instead of _displaySRV.
+    private SrPipeline?               _srPipeline;
+    private ID3D11Texture2D?          _npuOutTex;
+    private ID3D11ShaderResourceView? _npuOutSRV;
+    private volatile bool             _npuBusy;        // Phase 2 in progress
+    private volatile bool             _npuResultReady; // Phase 2 done, Phase 3 pending
+    private bool                      _npuHasResult;   // at least one committed result
 
-    /// When true: NPU (WinML) sharpening; when false: GPU (CAS) sharpening.
-    private volatile bool _npuEnabled; // volatile: set on UI thread, read on render thread
+    /// When true, NPU colour enhancement is active. CAS still runs after NPU.
+    private volatile bool _npuEnabled;
     public bool NpuSharpenEnabled
     {
         get => _npuEnabled;
@@ -250,6 +258,10 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         if (w == _displayW && h == _displayH) return;
         _displayTex?.Dispose(); _displaySRV?.Dispose();
         _displayRTV?.Dispose(); _displayUAV?.Dispose();
+        // NPU out texture is sized to match display — recreate lazily on next Render()
+        _npuOutTex?.Dispose(); _npuOutSRV?.Dispose();
+        _npuOutTex = null; _npuOutSRV = null;
+        _npuHasResult = false; _npuResultReady = false;
 
         var desc = new Texture2DDescription
         {
@@ -363,9 +375,10 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         EnsureDisplayTexture(planes.Width, planes.Height);
         EnsureYCbCrTextures(planes.Width, planes.Height);
 
-        UploadR8Plane(_yTex!,  planes.Y,  planes.YStride, planes.Width,  planes.Height);
-        UploadR8Plane(_cbTex!, planes.Cb, planes.CStride, planes.CStride, planes.CHeight);
-        UploadR8Plane(_crTex!, planes.Cr, planes.CStride, planes.CStride, planes.CHeight);
+        if (_yTex is null || _cbTex is null || _crTex is null) return; // EnsureYCbCrTextures failed
+        UploadR8Plane(_yTex,  planes.Y,  planes.YStride, planes.Width,  planes.Height);
+        UploadR8Plane(_cbTex, planes.Cb, planes.CStride, planes.CStride, planes.CHeight);
+        UploadR8Plane(_crTex, planes.Cr, planes.CStride, planes.CStride, planes.CHeight);
 
         // GPU render: YCbCr→BGRA into displayTexture
         _ctx.OMSetRenderTargets(_displayRTV!);
@@ -384,7 +397,8 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
 
     private unsafe void UploadR8Plane(ID3D11Texture2D tex, byte* data, int stride, int w, int h)
     {
-        var mapped = _ctx!.Map(tex, 0, MapMode.WriteDiscard);
+        if (_ctx is null || tex is null) return;
+        var mapped = _ctx.Map(tex, 0, MapMode.WriteDiscard);
         for (int row = 0; row < h; row++)
             Buffer.MemoryCopy(data + row * stride, (byte*)mapped.DataPointer + row * mapped.RowPitch, w, w);
         _ctx.Unmap(tex, 0);
@@ -451,19 +465,53 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
 
         // Unbind display texture from any lingering RTV before using it as SRV
         _ctx.OMSetRenderTargets((ID3D11RenderTargetView?)null);
-        if (_npuEnabled && _srPipeline is { IsAvailable: true } sr && !_npuBusy)
+
+        // ── NPU enhancement (3-phase, D3D11 calls on render thread only) ──────
+        var casSrc = _displaySRV; // default CAS source: unenhanced display texture
+        if (_npuEnabled && _srPipeline is { IsAvailable: true } sr)
         {
-            _npuBusy = true;
-            _ = sr.EnhanceInPlaceAsync(_ctx, _device!, _displayTex!,
-                                        _displayW, _displayH)
-                  .ContinueWith(_ => { _npuBusy = false; });
+            // Lazy-create NPU output texture the first time NPU is active
+            if (_npuOutTex is null && _displayTex is not null)
+            {
+                try
+                {
+                    var d = _displayTex.Description;
+                    _npuOutTex = _device!.CreateTexture2D(d);
+                    _npuOutSRV = _device.CreateShaderResourceView(_npuOutTex);
+                }
+                catch { _npuOutTex = null; _npuOutSRV = null; }
+            }
+
+            if (_npuOutTex is not null)
+            {
+                // Phase 3: commit previous inference result (if ready)
+                if (_npuResultReady)
+                {
+                    sr.CommitToTexture(_ctx, _npuOutTex, _displayW, _displayH);
+                    _npuResultReady = false;
+                    _npuHasResult   = true;
+                }
+
+                // Phase 1 + 2: start new inference for this frame (if pipeline is free)
+                if (!_npuBusy)
+                {
+                    _npuBusy = true;
+                    bool ready = sr.PrepareStagingRead(_ctx, _device!, _displayTex!, _displayW, _displayH);
+                    if (ready)
+                        _ = sr.RunInferenceAsync(_displayW, _displayH)
+                               .ContinueWith(_ => { _npuResultReady = true; _npuBusy = false; });
+                    else
+                        _npuBusy = false; // GPU not ready — try again next frame
+                }
+
+                if (_npuHasResult)
+                    casSrc = _npuOutSRV; // use NPU-enhanced texture as CAS source
+            }
         }
 
         // ── CAS sharpening pass (Adreno GPU) ─────────────────────────────────
-        // Reads _displayTex (YCbCr-converted frame) → writes _casOutTex.
-        // Skipped when NPU mode is active, sharpness is zero, or unavailable.
-        var presentSRV = _displaySRV; // default: present unsharpened
-        // CAS runs after NPU (or alone) — effects stack: NPU colour → GPU sharpen
+        // Reads casSrc (NPU-enhanced if available, else raw display texture) → _casOutTex.
+        var presentSRV = casSrc; // default: present without CAS
         if (Sharpness > 0f && _casCS is not null && _casOutUAV is not null && _casCB is not null)
         {
             // Update sharpness constant via Map/WriteDiscard (Dynamic CB)
@@ -476,7 +524,7 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
             }
 
             _ctx.CSSetShader(_casCS);
-            _ctx.CSSetShaderResources(0, [_displaySRV]);
+            _ctx.CSSetShaderResources(0, [casSrc]);
             _ctx.CSSetUnorderedAccessViews(0, [_casOutUAV]);
             _ctx.CSSetConstantBuffers(0, [_casCB]);
             _ctx.Dispatch(
@@ -559,6 +607,7 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _displayUAV?.Dispose(); _displayRTV?.Dispose();
         _displaySRV?.Dispose(); _displayTex?.Dispose();
         _srPipeline?.Dispose(); _srPipeline = null;
+        _npuOutSRV?.Dispose(); _npuOutTex?.Dispose();
         _casCB?.Dispose(); _casOutUAV?.Dispose(); _casOutSRV?.Dispose(); _casOutTex?.Dispose();
         _noCullRS?.Dispose(); _linearSampler?.Dispose();
         _ictCS?.Dispose(); _fillCS?.Dispose(); _casCS?.Dispose();

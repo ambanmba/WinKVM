@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Text;
+using WinKVM.Audio;
 using WinKVM.Framebuffer;
 using WinKVM.Input;
 
@@ -67,6 +68,16 @@ public sealed class ERICSession : INotifyPropertyChanged
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
 
+    // RAP audio
+    private RAPConnection?           _rapConn;
+    private Audio.AudioPlayer?       _audioPlayer;
+    private CancellationTokenSource? _rapCts;
+
+    // RFB session ID — received in ServerInit (0x05), required for RAP connection request
+    private uint    _rfbSessionId;
+    // e-RIC session ID string — from ConnectionParams, used for RAP type-5 auth
+    private string? _ericSessionId;
+
     // Last pointer position — keepalive sends to this position so it doesn't move the cursor.
     // Initialized to centre; updated on every real pointer event.
     private ushort _lastPtrX = 1280, _lastPtrY = 720;
@@ -92,9 +103,10 @@ public sealed class ERICSession : INotifyPropertyChanged
     public int FramebufferWidth  => _framebuffer?.Width  ?? 0;
     public int FramebufferHeight => _framebuffer?.Height ?? 0;
 
-    // FPS
-    private int   _fpsCount;
-    private DateTime _fpsLast = DateTime.Now;
+    // FPS — reset at start of each connection so stale time gaps don't skew the first bucket
+    private int      _fpsCount;
+    private DateTime _fpsLast;
+    private bool     _fpsFirstFrame = true; // used to seed AvgFps from first real measurement
 
     // Renderer reference (set by the view)
     public Rendering.D3DFramebufferControl? Renderer { get; set; }
@@ -134,6 +146,7 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     private void ReleaseResources()
     {
+        StopAudio();
         _conn?.Disconnect();
         _conn = null;
         _cts?.Cancel();
@@ -144,8 +157,65 @@ public sealed class ERICSession : INotifyPropertyChanged
         AudioSupport = null; VideoSettings = null; VideoQuality = null;
         KeyboardLayout = null; ConnectionParams.Clear();
         _host = _username = _password = null;
+        _rfbSessionId = 0; _ericSessionId = null;
+        _fpsCount = 0; _fpsFirstFrame = true; CurrentFps = 0; AvgFps = 0;
         _hextileDecoder.Reset();
         _dirtyRects.Clear();
+    }
+
+    // ── RAP Audio ─────────────────────────────────────────────────────────────
+
+    public async Task StartAudioAsync()
+    {
+        if (IsAudioActive || _host is null || _username is null || _password is null) return;
+
+        StopAudio(); // clean up any previous instance
+
+        var cts = new CancellationTokenSource();
+        _rapCts = cts;
+
+        var rap = new RAPConnection(_host, _port, _username, _password, _rfbSessionId, _ericSessionId);
+        _rapConn = rap;
+
+        var player = new Audio.AudioPlayer();
+        _audioPlayer = player;
+
+        rap.AudioPacketReceived += (pcm, sr, ch, bits, signed) =>
+            player.Feed(pcm, sr, ch, bits, signed);
+
+        bool ok = await rap.ConnectAsync(cts.Token);
+        if (!ok)
+        {
+            StopAudio();
+            return;
+        }
+
+        IsAudioActive = true;
+        OnPropertyChanged(nameof(IsAudioActive));
+
+        // Receive loop runs on thread pool — fires AudioPacketReceived callbacks
+        _ = rap.ReceiveLoopAsync(cts.Token).ContinueWith(_ =>
+        {
+            if (IsAudioActive) StopAudio();
+        });
+    }
+
+    public void StopAudio()
+    {
+        _rapCts?.Cancel();
+        _rapCts = null;
+
+        _rapConn?.Dispose();
+        _rapConn = null;
+
+        _audioPlayer?.Dispose();
+        _audioPlayer = null;
+
+        if (IsAudioActive)
+        {
+            IsAudioActive = false;
+            OnPropertyChanged(nameof(IsAudioActive));
+        }
     }
 
     // ── Protocol handshake ────────────────────────────────────────────────────
@@ -155,6 +225,9 @@ public sealed class ERICSession : INotifyPropertyChanged
 
     private async Task PerformConnectionAsync(CancellationToken ct)
     {
+        // Reset FPS state so stale time before connecting doesn't skew the first measurement
+        _fpsCount = 0; _fpsFirstFrame = true; CurrentFps = 0; AvgFps = 0;
+        _fpsLast = DateTime.Now;
         // Retry loop: auto-reconnect on server-initiated disconnect.
         // Gives up after an auth failure or user cancel.
         while (!ct.IsCancellationRequested)
@@ -287,7 +360,8 @@ public sealed class ERICSession : INotifyPropertyChanged
                     var siData = await _conn.ReadAsync(7, ct);
                     var sir = new BinaryReader2(siData);
                     sir.Skip(3);
-                    System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] ServerInit serverId={sir.ReadU32()}\n");
+                    _rfbSessionId = sir.ReadU32();
+                    System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}] ServerInit serverId={_rfbSessionId}\n");
                     break;
                 }
 
@@ -501,16 +575,24 @@ public sealed class ERICSession : INotifyPropertyChanged
         else
             await HandleNormalFBUpdateAsync(numRects, ct);
 
-        // FPS tracking
+        // FPS tracking — 1-second buckets; AvgFps is exponential moving average
         _fpsCount++;
-        var now = DateTime.Now;
+        var now     = DateTime.Now;
         var elapsed = (now - _fpsLast).TotalSeconds;
         if (elapsed >= 1.0)
         {
             CurrentFps = _fpsCount / elapsed;
-            AvgFps     = (AvgFps * 0.9) + (CurrentFps * 0.1);
-            _fpsCount  = 0;
-            _fpsLast   = now;
+            if (_fpsFirstFrame)
+            {
+                AvgFps = CurrentFps; // seed average from first real measurement
+                _fpsFirstFrame = false;
+            }
+            else
+            {
+                AvgFps = (AvgFps * 0.7) + (CurrentFps * 0.3); // faster convergence
+            }
+            _fpsCount = 0;
+            _fpsLast  = now;
         }
     }
 
@@ -745,8 +827,8 @@ public sealed class ERICSession : INotifyPropertyChanged
             System.IO.File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss}]   param[{i}] {name}={value}\n");
             ConnectionParams[name] = value;
         }
-        if (ConnectionParams.TryGetValue("audio_support", out var au))
-            AudioSupport = au;
+        if (ConnectionParams.TryGetValue("audio_support",  out var au)) AudioSupport   = au;
+        if (ConnectionParams.TryGetValue("eric_session_id", out var es)) _ericSessionId = es;
     }
 
     // ── ServerCommand ─────────────────────────────────────────────────────────

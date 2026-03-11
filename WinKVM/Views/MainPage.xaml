@@ -19,6 +19,7 @@
             <AppBarButton x:Name="PasteBtn"      Icon="Paste"      Label="Paste Clipboard" Click="PasteBtn_Click"/>
             <AppBarSeparator/>
             <AppBarButton x:Name="AIAgentBtn"    Icon="People"     Label="AI Agent"        Click="AIAgentBtn_Click"/>
+            <AppBarButton x:Name="AudioBtn"      Icon="Volume"     Label="Audio"           Click="AudioBtn_Click"/>
             <AppBarSeparator/>
             <!-- Sharpening controls -->
             <AppBarElementContainer VerticalContentAlignment="Center" Margin="4,0">

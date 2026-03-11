@@ -19,7 +19,6 @@ public sealed class SrPipeline : IDisposable
     private InferenceSession? _session;
     private bool              _ready;
     private bool              _disposed;
-    private bool              _busy;
     private int               _inferCount;
 
     // CPU-side float buffers reused across frames
@@ -106,7 +105,7 @@ public sealed class SrPipeline : IDisposable
             $"[{DateTime.Now:HH:mm:ss}] QNN InitAsync {width}x{height}\n");
         try
         {
-            var onnxBytes = OnnxBuilder.BuildDepthwiseSharpen(3, 0.25f, width, height);
+            var onnxBytes = OnnxBuilder.BuildDepthwiseSharpen(3, 0.3f, width, height);
             System.IO.File.AppendAllText(_log,
                 $"[{DateTime.Now:HH:mm:ss}] ONNX {onnxBytes.Length} bytes\n");
 
@@ -170,50 +169,48 @@ public sealed class SrPipeline : IDisposable
         }
     }
 
-    /// Run inference in-place on the display texture: GPU→CPU→QNN→CPU→GPU.
-    public async Task EnhanceInPlaceAsync(
-        ID3D11DeviceContext ctx, ID3D11Device device,
-        ID3D11Texture2D displayTex, int w, int h)
+    /// Phase 1 — capture current frame into CPU buffer.
+    /// Must be called on the render (D3D11) thread.
+    public bool PrepareStagingRead(ID3D11DeviceContext ctx, ID3D11Device device,
+                                   ID3D11Texture2D srcTex, int w, int h)
     {
-        if (!IsAvailable || _session is null || _busy) return;
-        _busy = true;
-        try
+        EnsureStaging(device, srcTex, w, h);
+        ctx.CopyResource(_stagingRead!, srcTex);
+        unsafe
         {
-            EnsureStaging(device, displayTex, w, h);
-
-            // GPU → CPU
-            ctx.CopyResource(_stagingRead!, displayTex);
-            unsafe
-            {
-                var m = ctx.Map(_stagingRead!, 0, MapMode.Read);
-                PackBgraToNchw((byte*)m.DataPointer, (int)m.RowPitch, _inputBuf, w, h);
-                ctx.Unmap(_stagingRead!, 0);
-            }
-
-            // QNN / NPU inference
-            var inputTensor = new DenseTensor<float>(_inputBuf.AsMemory(),
-                                                     new[] { 1, 3, h, w });
-            var inputs = new[] { NamedOnnxValue.CreateFromTensor("X", inputTensor) };
-            using var results = await Task.Run(() => _session.Run(inputs));
-            var outTensor = results.First().AsTensor<float>();
-            // Copy tensor data to output buffer
-            int idx = 0;
-            foreach (var v in outTensor) _outputBuf[idx++] = v;
-
-            // CPU → GPU
-            unsafe
-            {
-                var m = ctx.Map(_stagingWrite!, 0, MapMode.Write);
-                UnpackNchwToBgra(_outputBuf, (byte*)m.DataPointer, (int)m.RowPitch, w, h);
-                ctx.Unmap(_stagingWrite!, 0);
-            }
-            ctx.CopyResource(displayTex, _stagingWrite!);
-
-            if (++_inferCount <= 3)
-                System.IO.File.AppendAllText(_log,
-                    $"[{DateTime.Now:HH:mm:ss}] Inference #{_inferCount} ok\n");
+            var m = ctx.Map(_stagingRead!, 0, MapMode.Read);
+            PackBgraToNchw((byte*)m.DataPointer, (int)m.RowPitch, _inputBuf, w, h);
+            ctx.Unmap(_stagingRead!, 0);
+            return true;
         }
-        finally { _busy = false; }
+    }
+
+    /// Phase 2 — run ONNX inference on thread pool (no D3D11 calls).
+    public async Task RunInferenceAsync(int w, int h)
+    {
+        if (_session is null) return;
+        var inputTensor = new DenseTensor<float>(_inputBuf.AsMemory(), new[] { 1, 3, h, w });
+        var inputs = new[] { NamedOnnxValue.CreateFromTensor("X", inputTensor) };
+        using var results = await Task.Run(() => _session.Run(inputs));
+        var outTensor = results.First().AsTensor<float>();
+        int idx = 0;
+        foreach (var v in outTensor) _outputBuf[idx++] = v;
+        if (++_inferCount <= 5)
+            System.IO.File.AppendAllText(_log,
+                $"[{DateTime.Now:HH:mm:ss}] Inference #{_inferCount} ok\n");
+    }
+
+    /// Phase 3 — write inference result to dstTex.
+    /// Must be called on the render (D3D11) thread.
+    public void CommitToTexture(ID3D11DeviceContext ctx, ID3D11Texture2D dstTex, int w, int h)
+    {
+        unsafe
+        {
+            var m = ctx.Map(_stagingWrite!, 0, MapMode.Write);
+            UnpackNchwToBgra(_outputBuf, (byte*)m.DataPointer, (int)m.RowPitch, w, h);
+            ctx.Unmap(_stagingWrite!, 0);
+        }
+        ctx.CopyResource(dstTex, _stagingWrite!);
     }
 
     // ── Staging texture management ────────────────────────────────────────────

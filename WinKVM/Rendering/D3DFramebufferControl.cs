@@ -93,6 +93,16 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         => Input.ZoomHandler.MapToFramebuffer(sx, sy, rw, rh, fbW, fbH,
                _zoomUvOffX, _zoomUvOffY, _zoomUvSclX, _zoomUvSclY);
 
+    // ── SR zoom (ONNX model upscales the zoom sub-region to display resolution) ─
+    // 3-phase (same pattern as NPU): D3D11 on render thread, ONNX on thread pool.
+    // Requires sr_model.onnx next to the executable; falls back to Lanczos if absent.
+    private SrZoomPipeline?           _srZoomPipeline;
+    private ID3D11Texture2D?          _srZoomOutTex;
+    private ID3D11ShaderResourceView? _srZoomOutSRV;
+    private volatile bool             _srZoomBusy;
+    private volatile bool             _srZoomResultReady;
+    private bool                      _srZoomHasResult;
+
     // ── NPU enhancement (Hexagon NPU via ONNX Runtime + QNN) ─────────────────
     // 3-phase pipeline to keep D3D11 calls on the render thread:
     //   Phase 1 (render thread): PrepareStagingRead  — capture displayTex → _inputBuf
@@ -177,6 +187,12 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
             System.IO.File.AppendAllText(_d3dLog, $"[{DateTime.Now:HH:mm:ss}] Init complete\n");
             if (_npuEnabled && _srPipeline is null)
                 InitNpuAsync(); // re-create NPU pipeline after reconnect/Dispose
+            // SR zoom pipeline: load sr_model.onnx if present (silently skipped if absent)
+            if (_srZoomPipeline is null)
+            {
+                _srZoomPipeline = new SrZoomPipeline();
+                _ = _srZoomPipeline.InitAsync(2560, 1440); // dims updated once display size known
+            }
         }
         catch (Exception ex)
         {
@@ -303,6 +319,11 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _npuOutTex = null; _npuOutSRV = null;
         _npuHasResult = false; _npuResultReady = false;
 
+        // SR zoom output texture — sized to SR model output (may differ from display)
+        _srZoomOutTex?.Dispose(); _srZoomOutSRV?.Dispose();
+        _srZoomOutTex = null; _srZoomOutSRV = null;
+        _srZoomHasResult = false; _srZoomResultReady = false;
+
         var desc = new Texture2DDescription
         {
             Width  = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1,
@@ -352,13 +373,15 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         int cw = (w + 1) / 2, ch = (h + 1) / 2;
         if (_yTex is not null && _yTex.Description.Width == (uint)w && _yTex.Description.Height == (uint)h) return;
 
+        if (_device is null) return; // disposed between null-check and here — safe exit
         DisposeYCbCrTextures();
+        if (_device is null) return; // double-check after dispose (race window)
         _yTex  = MakeR8Texture(w,  h);  _ySRV  = _device!.CreateShaderResourceView(_yTex);
         _cbTex = MakeR8Texture(cw, ch); _cbSRV = _device.CreateShaderResourceView(_cbTex);
         _crTex = MakeR8Texture(cw, ch); _crSRV = _device.CreateShaderResourceView(_crTex);
     }
 
-    private ID3D11Texture2D MakeR8Texture(int w, int h) => _device!.CreateTexture2D(new Texture2DDescription
+    private ID3D11Texture2D MakeR8Texture(int w, int h) => (_device ?? throw new ObjectDisposedException(nameof(D3DFramebufferControl))).CreateTexture2D(new Texture2DDescription
     {
         Width  = (uint)w, Height = (uint)h, MipLevels = 1, ArraySize = 1,
         Format = Format.R8_UNorm,
@@ -586,6 +609,66 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
             presentSRV = _casOutSRV; // present the sharpened output
         }
 
+        // ── SR zoom pass (when zoomed + model loaded) ─────────────────────────
+        // Runs after CAS so it reads the CAS-sharpened source.
+        // When SR has a result, it overrides presentSRV and the ZoomCB is set
+        // to full-frame (1,1) so Display.hlsl shows the SR output without further zoom.
+        bool srZoomActive = false;
+        if (_zoomLevel > 1.49f && _srZoomPipeline is { IsAvailable: true } srz)
+        {
+            // Lazy-create the SR output texture once we know the model's output size
+            if (_srZoomOutTex is null && _displayTex is not null)
+            {
+                try
+                {
+                    var d = _displayTex.Description;
+                    d.Width  = (uint)srz.OutW;
+                    d.Height = (uint)srz.OutH;
+                    _srZoomOutTex = _device!.CreateTexture2D(d);
+                    _srZoomOutSRV = _device.CreateShaderResourceView(_srZoomOutTex);
+                }
+                catch { _srZoomOutTex = null; _srZoomOutSRV = null; }
+            }
+
+            if (_srZoomOutTex is not null)
+            {
+                // Phase 3: commit previous SR result
+                if (_srZoomResultReady)
+                {
+                    srz.CommitToTexture(_ctx, _srZoomOutTex);
+                    _srZoomResultReady = false;
+                    _srZoomHasResult   = true;
+                }
+
+                // Phase 1+2: start SR for this frame
+                if (!_srZoomBusy)
+                {
+                    _srZoomBusy = true;
+                    // Prefer reading from CAS output (sharpened) if available, else raw display
+                    var srSrc = (_casOutTex is not null && Sharpness > 0f) ? _casOutTex : _displayTex!;
+                    bool ok = srz.PrepareStagingRead(_ctx, _device!, srSrc,
+                                                    _displayW, _displayH,
+                                                    _zoomUvOffX, _zoomUvOffY, _zoomUvSclX, _zoomUvSclY);
+                    if (ok)
+                        _ = srz.RunInferenceAsync()
+                               .ContinueWith(_ => { _srZoomResultReady = true; _srZoomBusy = false; });
+                    else
+                        _srZoomBusy = false;
+                }
+
+                if (_srZoomHasResult)
+                {
+                    presentSRV  = _srZoomOutSRV; // SR output fills the display
+                    srZoomActive = true;           // tell ZoomCB to show full frame
+                }
+            }
+        }
+        else if (_zoomLevel <= 1.001f)
+        {
+            // Zoom reset — clear SR result so it doesn't show on next zoom
+            _srZoomHasResult = false;
+        }
+
         // ── Display pass (sharpened/unsharpened → swap chain) ─────────────────
         // Update ZoomCB: uvOffset, uvScale, srcTexel, zoomLevel, pad
         if (_displayZoomCB is not null)
@@ -594,10 +677,15 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
             {
                 var zm = _ctx.Map(_displayZoomCB, 0, MapMode.WriteDiscard);
                 var zp = (float*)zm.DataPointer;
-                zp[0] = _zoomUvOffX;          zp[1] = _zoomUvOffY;
-                zp[2] = _zoomUvSclX;          zp[3] = _zoomUvSclY;
-                zp[4] = 1.0f / _displayW;     zp[5] = 1.0f / _displayH;
-                zp[6] = _zoomLevel;           zp[7] = 0f;
+                // When SR zoom provides the output, show it full-frame (no Lanczos/unsharp)
+                zp[0] = srZoomActive ? 0f : _zoomUvOffX;
+                zp[1] = srZoomActive ? 0f : _zoomUvOffY;
+                zp[2] = srZoomActive ? 1f : _zoomUvSclX;
+                zp[3] = srZoomActive ? 1f : _zoomUvSclY;
+                zp[4] = srZoomActive ? 1.0f / (_srZoomPipeline?.OutW ?? _displayW) : 1.0f / _displayW;
+                zp[5] = srZoomActive ? 1.0f / (_srZoomPipeline?.OutH ?? _displayH) : 1.0f / _displayH;
+                zp[6] = srZoomActive ? 1.0f : _zoomLevel; // 1.0 = no Lanczos/unsharp on SR output
+                zp[7] = 0f;
                 _ctx.Unmap(_displayZoomCB, 0);
             }
         }
@@ -671,6 +759,8 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _displayUAV?.Dispose(); _displayRTV?.Dispose();
         _displaySRV?.Dispose(); _displayTex?.Dispose();
         _srPipeline?.Dispose(); _srPipeline = null;
+        _srZoomPipeline?.Dispose(); _srZoomPipeline = null;
+        _srZoomOutSRV?.Dispose(); _srZoomOutTex?.Dispose();
         _npuOutSRV?.Dispose(); _npuOutTex?.Dispose();
         _displayZoomCB?.Dispose();
         _casCB?.Dispose(); _casOutUAV?.Dispose(); _casOutSRV?.Dispose(); _casOutTex?.Dispose();
@@ -678,6 +768,7 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _ictCS?.Dispose(); _fillCS?.Dispose(); _casCS?.Dispose();
         _ycbcrPS?.Dispose(); _displayPS?.Dispose(); _fullscreenVS?.Dispose();
         _rtv?.Dispose(); _swapChain?.Dispose();
-        _ctx?.Dispose(); _device?.Dispose();
+        var ctx = _ctx; _ctx = null; ctx?.Dispose();
+        var dev = _device; _device = null; dev?.Dispose();
     }
 }

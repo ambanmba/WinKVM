@@ -19,6 +19,11 @@ public sealed partial class MainPage : Page
     private AgentLoop? _agentLoop;
     private DispatcherTimer? _fpsTimer;
 
+    // Pan/zoom state
+    private bool   _zoomMode;
+    private bool   _panning;
+    private double _lastPanX, _lastPanY;
+
     public MainPage()
     {
         InitializeComponent();
@@ -64,6 +69,14 @@ public sealed partial class MainPage : Page
             SendTextBtn.IsEnabled    = state == SessionState.Connected;
             PasteBtn.IsEnabled       = state == SessionState.Connected;
             AudioBtn.IsEnabled       = state == SessionState.Connected;
+            ZoomModeBtn.IsEnabled    = state == SessionState.Connected;
+            if (state != SessionState.Connected && _zoomMode)
+            {
+                _zoomMode = false;
+                ZoomModeBtn.IsChecked = false;
+                KvmRenderer.ResetZoom();
+                ZoomText.Visibility = Visibility.Collapsed;
+            }
             UpdateAudioBtn();
 
             if (state == SessionState.Connected)
@@ -187,6 +200,33 @@ public sealed partial class MainPage : Page
         AudioBtn.Label = _session.IsAudioActive ? "Stop Audio" : "Audio";
     }
 
+    private void ZoomModeBtn_Checked(object s, RoutedEventArgs e)
+    {
+        _zoomMode = true;
+    }
+
+    private void ZoomModeBtn_Unchecked(object s, RoutedEventArgs e)
+    {
+        _zoomMode = false;
+        _panning  = false;
+        KvmRenderer.ResetZoom();
+        ZoomText.Visibility = Visibility.Collapsed;
+    }
+
+    private void UpdateZoomText()
+    {
+        float z = KvmRenderer.ZoomLevel;
+        if (z <= 1.001f)
+        {
+            ZoomText.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            ZoomText.Text       = $"{z:F1}×";
+            ZoomText.Visibility = Visibility.Visible;
+        }
+    }
+
     private async void ScreenshotBtn_Click(object s, RoutedEventArgs e)
     {
         try
@@ -261,12 +301,46 @@ public sealed partial class MainPage : Page
     private void KvmRenderer_PointerMoved(object sender, PointerRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
-        SendMouseEvent(e); // reads current button state — preserves button during drag
+
+        if (_zoomMode && _panning)
+        {
+            var pt = e.GetCurrentPoint(KvmRenderer);
+            KvmRenderer.PanBy(
+                (float)((pt.Position.X - _lastPanX) / KvmRenderer.ActualWidth),
+                (float)((pt.Position.Y - _lastPanY) / KvmRenderer.ActualHeight));
+            _lastPanX = pt.Position.X;
+            _lastPanY = pt.Position.Y;
+            UpdateZoomText();
+            e.Handled = true;
+            return;
+        }
+
+        SendMouseEvent(e);
     }
 
     private void KvmRenderer_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
+        var pt = e.GetCurrentPoint(KvmRenderer);
+
+        if (_zoomMode && pt.Properties.IsMiddleButtonPressed)
+        {
+            _panning   = true;
+            _lastPanX  = pt.Position.X;
+            _lastPanY  = pt.Position.Y;
+            KvmRenderer.CapturePointer(e.Pointer);
+            e.Handled = true;
+            return;
+        }
+
+        if (_zoomMode && pt.Properties.IsRightButtonPressed)
+        {
+            KvmRenderer.ResetZoom();
+            UpdateZoomText();
+            e.Handled = true;
+            return;
+        }
+
         KvmRenderer.CapturePointer(e.Pointer);
         SendMouseEvent(e);
     }
@@ -274,6 +348,15 @@ public sealed partial class MainPage : Page
     private void KvmRenderer_PointerReleased(object sender, PointerRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
+
+        if (_panning)
+        {
+            _panning = false;
+            KvmRenderer.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+            return;
+        }
+
         KvmRenderer.ReleasePointerCapture(e.Pointer);
         SendMouseEvent(e);
     }
@@ -281,7 +364,19 @@ public sealed partial class MainPage : Page
     private void KvmRenderer_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
     {
         if (_session.State != SessionState.Connected) return;
-        var pt    = e.GetCurrentPoint(KvmRenderer);
+        var pt = e.GetCurrentPoint(KvmRenderer);
+
+        if (_zoomMode)
+        {
+            float factor  = pt.Properties.MouseWheelDelta > 0 ? 1.25f : 0.8f;
+            float normX   = (float)(pt.Position.X / KvmRenderer.ActualWidth);
+            float normY   = (float)(pt.Position.Y / KvmRenderer.ActualHeight);
+            KvmRenderer.ApplyZoomDelta(factor, normX, normY);
+            UpdateZoomText();
+            e.Handled = true;
+            return;
+        }
+
         var (x, y) = MouseHandler.FramebufferCoords(pt.Position.X, pt.Position.Y,
             KvmRenderer.ActualWidth, KvmRenderer.ActualHeight,
             _session.FramebufferWidth, _session.FramebufferHeight);
@@ -293,9 +388,16 @@ public sealed partial class MainPage : Page
     {
         var pt   = e.GetCurrentPoint(KvmRenderer);
         var mask = dragButton == 0xFF ? MouseHandler.ButtonMask(pt.Properties) : dragButton;
-        var (x, y) = MouseHandler.FramebufferCoords(pt.Position.X, pt.Position.Y,
-            KvmRenderer.ActualWidth, KvmRenderer.ActualHeight,
-            _session.FramebufferWidth, _session.FramebufferHeight);
+        ushort x, y;
+        if (KvmRenderer.ZoomLevel > 1.001f)
+            (x, y) = KvmRenderer.MapToFramebuffer(
+                pt.Position.X, pt.Position.Y,
+                KvmRenderer.ActualWidth, KvmRenderer.ActualHeight,
+                _session.FramebufferWidth, _session.FramebufferHeight);
+        else
+            (x, y) = MouseHandler.FramebufferCoords(pt.Position.X, pt.Position.Y,
+                KvmRenderer.ActualWidth, KvmRenderer.ActualHeight,
+                _session.FramebufferWidth, _session.FramebufferHeight);
         _ = _session.SendPointerEventAsync(x, y, mask);
     }
 }

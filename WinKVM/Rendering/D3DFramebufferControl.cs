@@ -53,6 +53,46 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
     /// CAS sharpness 0.0–1.0 (0 = off, 0.6 = default). Set from UI.
     public float Sharpness { get; set; } = 0.6f;
 
+    // ── Pan/zoom ─────────────────────────────────────────────────────────────
+    private float _zoomLevel = 1.0f;
+    private float _zoomCx = 0.5f, _zoomCy = 0.5f;
+    // Derived UV sub-rect (updated on every zoom/pan change)
+    private float _zoomUvOffX, _zoomUvOffY;
+    private float _zoomUvSclX = 1f, _zoomUvSclY = 1f;
+    private ID3D11Buffer? _displayZoomCB; // ZoomCB for Display.hlsl (32 bytes)
+
+    public float ZoomLevel => _zoomLevel;
+
+    public void ApplyZoomDelta(float factor, float atNormX, float atNormY)
+    {
+        (_zoomLevel, _zoomCx, _zoomCy) = Input.ZoomHandler.ApplyDelta(
+            _zoomLevel, _zoomCx, _zoomCy, factor, atNormX, atNormY);
+        UpdateZoomRect();
+    }
+
+    public void PanBy(float dNormX, float dNormY)
+    {
+        (_zoomCx, _zoomCy) = Input.ZoomHandler.Pan(_zoomLevel, _zoomCx, _zoomCy, dNormX, dNormY);
+        UpdateZoomRect();
+    }
+
+    public void ResetZoom()
+    {
+        _zoomLevel = 1.0f; _zoomCx = 0.5f; _zoomCy = 0.5f;
+        UpdateZoomRect();
+    }
+
+    private void UpdateZoomRect()
+    {
+        Input.ZoomHandler.ComputeZoomRect(_zoomLevel, _zoomCx, _zoomCy,
+            out _zoomUvOffX, out _zoomUvOffY, out _zoomUvSclX, out _zoomUvSclY);
+    }
+
+    public (ushort fbX, ushort fbY) MapToFramebuffer(
+        double sx, double sy, double rw, double rh, int fbW, int fbH)
+        => Input.ZoomHandler.MapToFramebuffer(sx, sy, rw, rh, fbW, fbH,
+               _zoomUvOffX, _zoomUvOffY, _zoomUvSclX, _zoomUvSclY);
+
     // ── NPU enhancement (Hexagon NPU via ONNX Runtime + QNN) ─────────────────
     // 3-phase pipeline to keep D3D11 calls on the render thread:
     //   Phase 1 (render thread): PrepareStagingRead  — capture displayTex → _inputBuf
@@ -295,6 +335,14 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
             // CAS resource creation failed — sharpening will be skipped in Render()
             _casOutTex = null; _casOutSRV = null; _casOutUAV = null; _casCB = null;
         }
+
+        // Zoom constant buffer: float2 uvOffset + float2 uvScale + float2 srcTexel + float zoomLevel + float pad = 32 bytes
+        _displayZoomCB?.Dispose();
+        _displayZoomCB = _device.CreateBuffer(new BufferDescription
+        {
+            ByteWidth = 32u, Usage = ResourceUsage.Dynamic,
+            BindFlags = BindFlags.ConstantBuffer, CPUAccessFlags = CpuAccessFlags.Write,
+        });
 
         _displayW = w; _displayH = h;
     }
@@ -539,6 +587,21 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         }
 
         // ── Display pass (sharpened/unsharpened → swap chain) ─────────────────
+        // Update ZoomCB: uvOffset, uvScale, srcTexel, zoomLevel, pad
+        if (_displayZoomCB is not null)
+        {
+            unsafe
+            {
+                var zm = _ctx.Map(_displayZoomCB, 0, MapMode.WriteDiscard);
+                var zp = (float*)zm.DataPointer;
+                zp[0] = _zoomUvOffX;          zp[1] = _zoomUvOffY;
+                zp[2] = _zoomUvSclX;          zp[3] = _zoomUvSclY;
+                zp[4] = 1.0f / _displayW;     zp[5] = 1.0f / _displayH;
+                zp[6] = _zoomLevel;           zp[7] = 0f;
+                _ctx.Unmap(_displayZoomCB, 0);
+            }
+        }
+
         var sc = _swapChain!.Description1;
         var vp = new Viewport(0, 0, (float)sc.Width, (float)sc.Height);
         _ctx.OMSetRenderTargets(_rtv);
@@ -549,6 +612,7 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _ctx.PSSetShader(_displayPS!);
         _ctx.PSSetShaderResources(0, [presentSRV]);
         _ctx.PSSetSamplers(0, [_linearSampler!]);
+        _ctx.PSSetConstantBuffers(0, [_displayZoomCB]);
         _ctx.Draw(3, 0);
 
         _swapChain.Present(0, PresentFlags.None);
@@ -608,6 +672,7 @@ public sealed class D3DFramebufferControl : Grid, IDisposable
         _displaySRV?.Dispose(); _displayTex?.Dispose();
         _srPipeline?.Dispose(); _srPipeline = null;
         _npuOutSRV?.Dispose(); _npuOutTex?.Dispose();
+        _displayZoomCB?.Dispose();
         _casCB?.Dispose(); _casOutUAV?.Dispose(); _casOutSRV?.Dispose(); _casOutTex?.Dispose();
         _noCullRS?.Dispose(); _linearSampler?.Dispose();
         _ictCS?.Dispose(); _fillCS?.Dispose(); _casCS?.Dispose();

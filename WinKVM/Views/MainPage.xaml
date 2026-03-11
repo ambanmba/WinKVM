@@ -20,6 +20,8 @@
             <AppBarSeparator/>
             <AppBarButton x:Name="AIAgentBtn"    Icon="People"     Label="AI Agent"        Click="AIAgentBtn_Click"/>
             <AppBarButton x:Name="AudioBtn"      Icon="Volume"     Label="Audio"           Click="AudioBtn_Click"/>
+            <AppBarToggleButton x:Name="ZoomModeBtn" Icon="ZoomIn" Label="Zoom Mode"
+                                IsEnabled="False" Checked="ZoomModeBtn_Checked" Unchecked="ZoomModeBtn_Unchecked"/>
             <AppBarSeparator/>
             <!-- Sharpening controls -->
             <AppBarElementContainer VerticalContentAlignment="Center" Margin="4,0">
@@ -47,6 +49,9 @@
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                FontSize="12"/>
                     <TextBlock x:Name="FpsText" VerticalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               FontSize="12" FontFamily="Consolas" Visibility="Collapsed"/>
+                    <TextBlock x:Name="ZoomText" VerticalAlignment="Center"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                FontSize="12" FontFamily="Consolas" Visibility="Collapsed"/>
                 </StackPanel>
